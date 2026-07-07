@@ -7,6 +7,7 @@
 # Contributed and/or modified by Vaibhav Thakkar
 # Contributed and/or modified by Ioannis Iakovidis
 # Contributed and/or modified by Korakitis Angelos, as part of Google Summer of Code 2025 program.
+# Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
 
 # Licensed under GNU LGPL.3, see LICENCE file
 
@@ -368,6 +369,35 @@ add_test(NAME order_polytope_basics COMMAND order_polytope -tc=basics)
 add_test(NAME order_polytope_line_intersect COMMAND order_polytope -tc=line_intersect)
 add_test(NAME order_polytope_reflection COMMAND order_polytope -tc=reflection)
 add_test(NAME order_polytope_vec_mult COMMAND order_polytope -tc=vec_mult)
+add_test(NAME order_polytope_trig_helper COMMAND order_polytope -tc=trig_helper)
+add_test(NAME order_polytope_trig_lower_bound_hit COMMAND order_polytope -tc=trig_lower_bound_hit)
+add_test(NAME order_polytope_trig_upper_bound_hit COMMAND order_polytope -tc=trig_upper_bound_hit)
+add_test(NAME order_polytope_trig_order_facet_hit COMMAND order_polytope -tc=trig_order_facet_hit)
+add_test(NAME order_polytope_trig_shifted COMMAND order_polytope -tc=trig_shifted)
+add_test(NAME order_polytope_trig_normalized COMMAND order_polytope -tc=trig_normalized)
+add_test(NAME order_polytope_trig_repeated_facet COMMAND order_polytope -tc=trig_repeated_facet)
+add_test(NAME order_polytope_trig_shifted_normalized COMMAND order_polytope -tc=trig_shifted_normalized)
+add_test(NAME order_polytope_true_box_facets COMMAND order_polytope -tc=true_box_facets)
+add_test(NAME order_polytope_true_relation_facets COMMAND order_polytope -tc=true_relation_facets)
+add_test(NAME order_polytope_ghmc COMMAND order_polytope -tc=order_polytope_ghmc)
+add_test(NAME order_polytope_ghmc_hp_compare COMMAND order_polytope -tc=order_polytope_ghmc_hp_compare)
+add_test(NAME order_polytope_coord_intersect_normalized_shifted COMMAND order_polytope -tc=coord_intersect_normalized_shifted)
+add_test(NAME order_polytope_event_queue_facets COMMAND order_polytope -tc=event_queue_facets)
+
+add_executable (linear_extensions_volume_test linear_extensions_volume_test.cpp $<TARGET_OBJECTS:test_main>)
+add_test(NAME le_transitive_reduction COMMAND linear_extensions_volume_test -tc=transitive_reduction)
+add_test(NAME le_log_factorial_identity COMMAND linear_extensions_volume_test -tc=log_factorial_identity)
+add_test(NAME le_volume_chain COMMAND linear_extensions_volume_test -tc=linear_extensions_volume_chain)
+add_test(NAME le_volume_antichain COMMAND linear_extensions_volume_test -tc=linear_extensions_volume_antichain)
+add_test(NAME le_volume_generic_walk COMMAND linear_extensions_volume_test -tc=linear_extensions_volume_generic_walk)
+add_test(NAME le_reduction_chain_exact COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_chain_exact)
+add_test(NAME le_reduction_antichain_exact COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_antichain_exact)
+add_test(NAME le_reduction_parallel COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_parallel_decomposition)
+add_test(NAME le_reduction_ordinal COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_ordinal_sum_decomposition)
+add_test(NAME le_reduction_mixed COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_mixed_recursive_decomposition)
+add_test(NAME le_reduction_exact_dp COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_small_exact_dp)
+add_test(NAME le_reduction_residual COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_residual_fallback)
+add_test(NAME le_reduction_options COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_options)
 
 add_executable (matrix_sampling_test sampling_correlation_matrices_test.cpp $<TARGET_OBJECTS:test_main>)
 add_test(NAME test_corre_spectra_classes COMMAND matrix_sampling_test -tc=corre_spectra)
@@ -456,6 +486,7 @@ TARGET_LINK_LIBRARIES(crhmc_polytope_preparation_test ${PTHREAD} ${GMP} ${MPSOLV
 TARGET_LINK_LIBRARIES(logconcave_sampling_test lp_solve ${IFOPT} ${IFOPT_IPOPT} ${PTHREAD} ${GMP} ${MPSOLVE} ${FFTW3} ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(crhmc_sampling_test lp_solve ${IFOPT} ${IFOPT_IPOPT} ${PTHREAD} ${GMP} ${MPSOLVE} ${FFTW3} ${MKL_LINK} QD_LIB coverage_config)
 TARGET_LINK_LIBRARIES(order_polytope lp_solve coverage_config)
+TARGET_LINK_LIBRARIES(linear_extensions_volume_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(matrix_sampling_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(test_internal_points lp_solve ${MKL_LINK} coverage_config)
 find_package(LAPACK REQUIRED)
