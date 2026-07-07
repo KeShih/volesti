@@ -5,6 +5,7 @@
 // Copyright (c) 2020-2021 Vaibhav Thakkar
 
 // Contributed and/or modified by Vaibhav Thakkar, as part of Google Summer of Code 2021 program.
+// Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
 
 // Licensed under GNU LGPL.3, see LICENCE file
 
@@ -134,6 +135,40 @@ public:
         std::vector<unsigned int> res;
         sorted_list(n, order_relations, res);
         return res;
+    }
+
+
+    // Remove redundant edges implied by transitivity.
+    // An edge (u,v) is redundant if u can reach v through other edges.
+    Poset transitive_reduction() const
+    {
+        std::vector<std::vector<bool>> reach(n, std::vector<bool>(n, false));
+        for (auto const& rel : order_relations)
+            reach[rel.first][rel.second] = true;
+
+        for (unsigned int k = 0; k < n; ++k)
+            for (unsigned int i = 0; i < n; ++i)
+                if (reach[i][k])
+                    for (unsigned int j = 0; j < n; ++j)
+                        reach[i][j] = reach[i][j] || reach[k][j];
+
+        RV reduced;
+        std::vector<std::vector<bool>> kept(n, std::vector<bool>(n, false));
+        for (auto const& rel : order_relations) {
+            if (kept[rel.first][rel.second])  // drop duplicate edges
+                continue;
+            bool redundant = false;
+            for (unsigned int k = 0; k < n && !redundant; ++k) {
+                if (k != rel.first && k != rel.second &&
+                    reach[rel.first][k] && reach[k][rel.second])
+                    redundant = true;
+            }
+            if (!redundant) {
+                kept[rel.first][rel.second] = true;
+                reduced.push_back(rel);
+            }
+        }
+        return Poset(n, reduced);
     }
 };
 
