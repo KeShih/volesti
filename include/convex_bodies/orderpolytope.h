@@ -5,16 +5,24 @@
 // Copyright (c) 2020-2021 Vaibhav Thakkar
 
 // Contributed and/or modified by Vaibhav Thakkar, as part of Google Summer of Code 2021 program.
+// Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
 
 // Licensed under GNU LGPL.3, see LICENCE file
 
 #ifndef ORDER_POLYTOPE_H
 #define ORDER_POLYTOPE_H
 
+#include <algorithm>
+#include <cassert>
+#include <cmath>
 #include <iostream>
+#include <limits>
+#include <type_traits>
+#include <vector>
 #include "misc/poset.h"
 #include <Eigen/Eigen>
 #include "preprocess/max_inscribed_ball.hpp"
+#include "root_finders/trigonometric_equation_solvers.hpp"
 #ifndef DISABLE_LPSOLVE
     #include "lp_oracles/solve_lp.h"
 #endif
@@ -39,15 +47,26 @@ private:
 
     unsigned int _num_hyperplanes;
     bool _normalized;
+    std::vector<unsigned char> _lower_bound_is_facet, _upper_bound_is_facet;
 
 public:
-    OrderPolytope(Poset const& poset) : _poset(poset)
+    // NOTE: by default the input poset is replaced by its transitive
+    // reduction, so redundant (non-cover) relations are dropped: the matrix A
+    // has fewer rows than 2*d + poset.num_relations() for non-reduced input,
+    // and row 2*d + k corresponds to get_order_relation(k) of the *reduced*
+    // poset.  Pass apply_transitive_reduction = false to keep the input
+    // relations verbatim (facet classification still marks every bound
+    // shadowed by some relation as a non-facet).
+    OrderPolytope(Poset const& poset, bool apply_transitive_reduction = true)
+        : _poset(apply_transitive_reduction ? poset.transitive_reduction() : poset)
     {
         _d = _poset.num_elem();
         _num_hyperplanes = 2*_d + _poset.num_relations(); // 2*d are for >=0 and <=1 constraints
         b = Eigen::MatrixXd::Zero(_num_hyperplanes, 1);
         _A = Eigen::MatrixXd::Zero(_num_hyperplanes, _d);
         _row_norms = Eigen::MatrixXd::Constant(_num_hyperplanes, 1, 1.0);
+        _lower_bound_is_facet.assign(_d, 1);
+        _upper_bound_is_facet.assign(_d, 1);
 
         // first add (ai >= 0) or (-ai <= 0) rows
         _A.topLeftCorner(_d, _d) = -Eigen::MatrixXd::Identity(_d, _d);
@@ -56,12 +75,14 @@ public:
         _A.block(_d, 0, _d, _d) = Eigen::MatrixXd::Identity(_d, _d);
         b.block(_d, 0, _d, 1) = Eigen::MatrixXd::Constant(_d, 1, 1.0);
 
-        // next add the relations
+        // next add the cover relations (transitive reduction already applied)
         unsigned int num_relations = _poset.num_relations();
         for(int idx=0; idx<num_relations; ++idx) {
             std::pair<unsigned int, unsigned int> curr_relation = _poset.get_relation(idx);
             _A(2*_d + idx, curr_relation.first)  = 1;
             _A(2*_d + idx, curr_relation.second) = -1;
+            _upper_bound_is_facet[curr_relation.first] = 0;
+            _lower_bound_is_facet[curr_relation.second] = 0;
         }
         _row_norms.block(2*_d, 0, num_relations, 1) = Eigen::MatrixXd::Constant(num_relations, 1, sqrt(2));
 
@@ -82,6 +103,28 @@ public:
         return _num_hyperplanes;
     }
 
+    bool lower_bound_is_facet(unsigned int i) const {
+        assert(i < _d);
+        return _lower_bound_is_facet[i] != 0;
+    }
+
+    bool upper_bound_is_facet(unsigned int i) const {
+        assert(i < _d);
+        return _upper_bound_is_facet[i] != 0;
+    }
+
+    unsigned int num_order_relations() const { return _poset.num_relations(); }
+    Poset::RT get_order_relation(unsigned int idx) const { return _poset.get_relation(idx); }
+
+    // All stored relations are cover relations (facets) after transitive reduction.
+    unsigned int num_true_facets() const {
+        unsigned int count = _poset.num_relations();
+        for (unsigned int i = 0; i < _d; ++i) {
+            if (lower_bound_is_facet(i)) ++count;
+            if (upper_bound_is_facet(i)) ++count;
+        }
+        return count;
+    }
 
     // get ith column of A
     VT get_col (unsigned int i) const {
@@ -106,7 +149,7 @@ public:
         return b;
     }
 
-    bool is_normalized ()
+    bool is_normalized () const
     {
         return _normalized;
     }
@@ -244,6 +287,87 @@ public:
 
         return inner_ball;
 
+    }
+
+
+    // Boundary oracle for exact Gaussian HMC (spherical).
+    // Finds smallest positive t such that a facet of Ax <= b is hit
+    // by the trajectory p(t) = r*cos(omega*t) + v/omega*sin(omega*t).
+    // Avoids dense A*r and A*v products by exploiting facet structure.
+    std::pair<NT, int> trigonometric_positive_intersect(Point const& r, Point const& v,
+                                                        NT const& omega, int& facet_prev) const
+    {
+        NT best_t = std::numeric_limits<NT>::max();
+        int best_facet = -1;
+
+        const VT& rc = r.getCoefficients();
+        const VT& vc = v.getCoefficients();
+
+        const NT rehit_tol = NT(1e-10), time_tol = NT(1e-12), value_tol = NT(1e-12);
+        static const NT pi = std::acos(NT(-1));
+        const NT inv_omega = NT(1) / omega;
+        const NT period = NT(2) * pi * inv_omega;
+
+        auto first_solution = [&](NT cos_coeff, NT sin_coeff, NT rhs, NT min_t, NT& root) {
+            auto res = first_trigonometric_solution(cos_coeff, sin_coeff, rhs, inv_omega,
+                                                    period, min_t, time_tol, value_tol);
+            root = res.first;
+            return res.second;
+        };
+
+        auto solve_and_consider = [&](NT cos_coeff, NT sin_coeff, NT rhs, int facet) {
+            NT min_t = (facet == facet_prev) ? rehit_tol : NT(0);
+            NT root;
+
+            if (best_t < std::numeric_limits<NT>::max()) {
+                NT const slack = rhs - cos_coeff;
+                NT const value_scale = std::max(NT(1),
+                    std::max(std::abs(cos_coeff), std::max(std::abs(sin_coeff), std::abs(rhs))));
+                NT const value_eps = value_tol * value_scale;
+                NT const speed_bound = omega * (std::abs(cos_coeff) + std::abs(sin_coeff));
+
+                if (slack > speed_bound * best_t + value_eps) return;
+            }
+
+            bool hit = first_solution(cos_coeff, sin_coeff, rhs, min_t, root);
+
+            if (hit && !(root > NT(0))) {
+                const NT value_scale = std::max(NT(1), std::max(std::abs(cos_coeff), std::abs(rhs)));
+                if (std::abs(cos_coeff - rhs) <= NT(1e-12) * value_scale)
+                    hit = first_solution(cos_coeff, sin_coeff, rhs, rehit_tol, root);
+            }
+
+            if (!hit || !(root > NT(0))) return;
+            if (root < best_t) {
+                best_t = root;
+                best_facet = facet;
+            }
+        };
+
+        for (unsigned int f = 0; f < _d; ++f)
+            if (_lower_bound_is_facet[f])
+                solve_and_consider(-rc(f), -vc(f) * inv_omega, b(f), static_cast<int>(f));
+
+        for (unsigned int i = 0; i < _d; ++i)
+            if (_upper_bound_is_facet[i])
+                solve_and_consider(rc(i), vc(i) * inv_omega, b(_d + i), static_cast<int>(_d + i));
+
+        unsigned int num_rel = _poset.num_relations();
+        for (unsigned int k = 0; k < num_rel; ++k) {
+            unsigned int f = 2 * _d + k;
+            auto rel = _poset.get_relation(k);
+            NT ar = rc(rel.first) - rc(rel.second);
+            NT av = vc(rel.first) - vc(rel.second);
+            if (_normalized) {
+                NT s = _row_norms(f);
+                ar /= s;
+                av /= s;
+            }
+            solve_and_consider(ar, av * inv_omega, b(f), static_cast<int>(f));
+        }
+
+        facet_prev = best_facet;
+        return std::make_pair(best_t, best_facet);
     }
 
 
@@ -618,9 +742,6 @@ public:
         // iterate over all hyperplanes
         for(unsigned int i = 0; i<rows; ++i) {
             NT a = _A(i, rand_coord);
-            if(_normalized) {
-                a = a / _row_norms(i);
-            }
 
             if (a == NT(0)) {
                 // throw std::runtime_error("Error: division by 0");
@@ -722,8 +843,11 @@ public:
 
 
     // compute reflection given dot product and facet
-    void compute_reflection(Point& v, NT dot_prod, unsigned int facet) const
+    void compute_reflection(Point& v, NT dot_prod, int facet) const
     {
+        // a negative facet (e.g. the -1 "no hit" sentinel) would wrap in the
+        // signed/unsigned comparisons below and index out of bounds
+        assert(facet >= 0 && static_cast<unsigned int>(facet) < _num_hyperplanes);
         // calculating -> v += -2 * dot_prod * A.row(facet);
         if (facet < _d) {
             v.set_coord(facet, v[facet] - 2 * dot_prod * (-1.0));
@@ -740,8 +864,9 @@ public:
 
 
     // compute reflection in O(1) time for order polytope
-    void compute_reflection(Point& v, Point const&, unsigned int facet) const
+    void compute_reflection(Point& v, Point const&, int const& facet) const
     {
+        assert(facet >= 0 && static_cast<unsigned int>(facet) < _num_hyperplanes);
         NT dot_prod;
         if (facet < _d) {
             dot_prod = -v[facet];
@@ -759,7 +884,8 @@ public:
     }
 
 
-    template <typename update_parameters>
+    template <typename update_parameters,
+              typename = std::enable_if_t<!std::is_arithmetic_v<update_parameters>>>
     void compute_reflection(Point &v, Point const&, update_parameters const& params) const
     {
         NT dot_prod = params.inner_vi_ak;
