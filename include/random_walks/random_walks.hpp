@@ -3,6 +3,8 @@
 // Copyright (c) 2020-2021 Vissarion Fisikopoulos
 // Copyright (c) 2020-2021 Apostolos Chalkis
 
+// Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
+
 // Licensed under GNU LGPL.3, see LICENCE file
 
 #ifndef RANDOM_WALKS_RANDOM_WALKS_HPP
@@ -26,6 +28,7 @@
 #include "random_walks/uniform_accelerated_billiard_walk.hpp"
 #include "random_walks/gaussian_accelerated_billiard_walk.hpp"
 #include "random_walks/gaussian_hamiltonian_monte_carlo_exact_walk.hpp"
+#include "random_walks/order_polytope_gaussian_hmc_exact_walk.hpp"
 #include "random_walks/exponential_hamiltonian_monte_carlo_exact_walk.hpp"
 #include "random_walks/uniform_accelerated_billiard_walk_parallel.hpp"
 #include "random_walks/hamiltonian_monte_carlo_walk.hpp"
