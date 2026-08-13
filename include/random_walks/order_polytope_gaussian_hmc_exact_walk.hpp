@@ -18,6 +18,7 @@
 
 #ifdef VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
 #include <cstdio>
+#include "root_finders/trigonometric_equation_solvers.hpp"
 #endif
 
 #include "random_walks/compute_diameter.hpp"
@@ -94,6 +95,13 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
         typedef typename Polytope::VT VT;
         typedef typename Polytope::MT MT;
 
+        enum class trajectory_status {
+            success,
+            reflection_limit,
+            shared_coordinate_contact,
+            numerical_failure
+        };
+
         Walk(Polytope &P, Point const& p, NT const& a_i, RandomNumberGenerator &rng)
             : Walk(P, p, a_i, rng, parameters(0, false, 0, false))
         {}
@@ -107,7 +115,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             _Len = params.set_L ? params.m_L : default_trajectory_length(P);
             _rho = params.set_rho ? params.rho : 100 * P.dimension();
             _rebase_interval = params.rebase_interval;
-            _last_hit_fid = no_facet();
+            _last_status = trajectory_status::success;
             build_event_facets(P);
             initialize(P, p, rng);
         }
@@ -126,21 +134,26 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
                 T = rng.sample_urdist() * _Len;
                 _v = GetDirection<Point>::apply(n, rng, false);
                 Point p0 = _p;
-                unsigned int const last_hit0 = _last_hit_fid;
+                _saved_last_hit_facets.assign(_last_hit_facets.begin(),
+                                              _last_hit_facets.end());
 
                 if (!advance_event_queue(P, T)) {
-                    // Restore the pre-leg state, including the residual-root
-                    // guard: p0 may sit exactly on the facet it was last
-                    // reflected on, while the aborted leg's last hit is
-                    // unrelated to p0.
+                    // Restore all persistent state changed by this leg.  The
+                    // next leg fully refreshes velocity and rebuilds its
+                    // event queue, but its residual-root guard must still
+                    // describe the restored position.
                     _p = p0;
-                    _last_hit_fid = last_hit0;
+                    set_last_hit_facets(_saved_last_hit_facets);
+                    if (_last_status != trajectory_status::reflection_limit)
+                        break;
                 }
             }
             p = _p;
         }
 
         inline void update_delta(NT L) { _Len = L; }
+
+        inline trajectory_status last_trajectory_status() const { return _last_status; }
 
     private:
 
@@ -218,6 +231,18 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
 
             bool empty() const { return _h.empty(); }
 
+            bool min_key(NT& key_out) const
+            {
+                if (_h.empty()) return false;
+                key_out = _h[0].key;
+                return true;
+            }
+
+            inline bool contains(unsigned int id) const
+            {
+                return _pos[id] >= 0;
+            }
+
             void insert_or_update(unsigned int id, NT key)
             {
                 VOLESTI_HMC_COUNT(n_heap_insert);
@@ -278,27 +303,27 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             NT const rel_scale = P.is_normalized() ? NT(1) / std::sqrt(NT(2)) : NT(1);
 
             _f_i0.clear(); _f_i1.clear(); _f_s0.clear(); _f_s1.clear();
-            _f_C.clear(); _f_wall.clear(); _f_row.clear();
+            _f_C.clear(); _f_wall.clear();
 
             auto add_facet = [&](unsigned int i0, unsigned int i1, NT s0, NT s1,
-                                 NT C, bool wall, unsigned int row) {
+                                 NT C, bool wall) {
                 _f_i0.push_back(i0); _f_i1.push_back(i1);
                 _f_s0.push_back(s0); _f_s1.push_back(s1); _f_C.push_back(C);
-                _f_wall.push_back(wall ? 1 : 0); _f_row.push_back(row);
+                _f_wall.push_back(wall ? 1 : 0);
             };
 
             for (unsigned int i = 0; i < n; ++i)
                 if (P.lower_bound_is_facet(i))
-                    add_facet(i, i, NT(-1), NT(0), b_event(i), true, i);
+                    add_facet(i, i, NT(-1), NT(0), b_event(i), true);
 
             for (unsigned int i = 0; i < n; ++i)
                 if (P.upper_bound_is_facet(i))
-                    add_facet(i, i, NT(1), NT(0), b_event(n + i), true, n + i);
+                    add_facet(i, i, NT(1), NT(0), b_event(n + i), true);
 
             for (unsigned int k = 0; k < P.num_order_relations(); ++k) {
                 auto rel = P.get_order_relation(k);
                 add_facet(rel.first, rel.second, rel_scale, -rel_scale,
-                          b_event(2 * n + k), false, 2 * n + k);
+                          b_event(2 * n + k), false);
             }
 
             unsigned int const F = static_cast<unsigned int>(_f_i0.size());
@@ -324,6 +349,13 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             _events.init(F);
             _ev_cos.assign(F, NT(0));
             _ev_sin.assign(F, NT(0));
+            _contact_batch.reserve(F);
+#ifdef VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
+            _verify_facets.reserve(F);
+#endif
+            _last_hit_mask.assign(F, 0);
+            _last_hit_facets.reserve(F);
+            _saved_last_hit_facets.reserve(F);
             _affected_mask.assign(F, 0);
             _affected_list.resize(F);
         }
@@ -335,13 +367,29 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             _v = GetDirection<Point>::apply(n, rng, false);
 
             NT T = rng.sample_urdist() * _Len;
-            advance_event_queue(P, T);
+            Point const p0 = _p;
+            _saved_last_hit_facets.assign(_last_hit_facets.begin(),
+                                          _last_hit_facets.end());
+            if (!advance_event_queue(P, T)) {
+                _p = p0;
+                set_last_hit_facets(_saved_last_hit_facets);
+            }
         }
 
         inline bool advance_event_queue(Polytope const& P, NT T)
         {
             (void)P;
             VOLESTI_HMC_COUNT(n_trajectories);
+            _last_status = trajectory_status::success;
+
+            if (!std::isfinite(T) || T < NT(0) ||
+                !std::isfinite(_omega) || _omega <= NT(0) ||
+                !std::isfinite(_inv_omega) ||
+                !_p.getCoefficients().allFinite() ||
+                !_v.getCoefficients().allFinite()) {
+                _last_status = trajectory_status::numerical_failure;
+                return false;
+            }
 
             NT theta_rem = _omega * T;
             unsigned int it = 0;
@@ -350,28 +398,59 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             while (theta_rem > NT(0))
             {
                 NT const theta_chunk = std::min(theta_rem, chunk_cap());
-                begin_chunk(theta_chunk);
+                if (!begin_chunk(theta_chunk)) {
+                    _last_status = trajectory_status::numerical_failure;
+                    return false;
+                }
 
                 for (;;)
                 {
-                    unsigned int fid;
-                    if (!pop_next_valid_event(fid)) {
+                    bool has_event = false;
+                    if (!pop_next_contact_batch(has_event)) {
+                        _last_status = trajectory_status::numerical_failure;
+                        return false;
+                    }
+                    if (!has_event) {
                         materialize_global_state(_end_cos, _end_sin);
                         theta_rem -= theta_chunk;
                         break;
                     }
 
 #ifdef VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
-                    verify_event_against_full_scan(P, fid);
+                    verify_contact_batch_against_full_scan(P);
 #endif
 
-                    accept_event(fid);
-                    VOLESTI_HMC_COUNT(n_reflections);
-                    reflect_event(fid);
-                    ++it;
-                    ++reflections_since_rebase;
+                    // Batch membership is established against the same
+                    // pre-reflection state.  Identity-mass reflections on
+                    // facets with disjoint coordinate supports commute.  A
+                    // shared-coordinate contact is deliberately unresolved:
+                    // abort the leg so apply()/initialize() can roll back.
+                    if (_contact_batch.size() > 1 && !contact_batch_is_disjoint()) {
+                        _last_status = trajectory_status::shared_coordinate_contact;
+                        return false;
+                    }
 
-                    if (it >= _rho) return false;
+                    if (_contact_batch.size() == 1) {
+                        unsigned int const fid = _contact_batch.front();
+                        accept_event(fid);
+                        VOLESTI_HMC_COUNT(n_reflections);
+                        reflect_event(fid);
+                        ++it;
+                        ++reflections_since_rebase;
+                    } else {
+                        accept_contact_batch();
+                        for (unsigned int const fid : _contact_batch) {
+                            VOLESTI_HMC_COUNT(n_reflections);
+                            reflect_event(fid);
+                            ++it;
+                            ++reflections_since_rebase;
+                        }
+                    }
+
+                    if (it >= _rho) {
+                        _last_status = trajectory_status::reflection_limit;
+                        return false;
+                    }
 
                     if (_rebase_interval > 0 &&
                         reflections_since_rebase >= _rebase_interval &&
@@ -387,7 +466,15 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
                         break;
                     }
 
-                    recompute_incident_facets(fid);
+                    if (_contact_batch.size() == 1)
+                        recompute_incident_facets(_contact_batch.front());
+                    else
+                        recompute_incident_facets_batch();
+
+                    if (_event_oracle_failed) {
+                        _last_status = trajectory_status::numerical_failure;
+                        return false;
+                    }
                 }
             }
 
@@ -397,7 +484,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
         // Start a chunk covering angles (0, theta_chunk] from the current
         // global state (_p, _v).  The single sincos call per chunk is the
         // only trigonometric evaluation on the non-exceptional path.
-        inline void begin_chunk(NT theta_chunk)
+        inline bool begin_chunk(NT theta_chunk)
         {
             _alpha = _p.getCoefficients();
             _beta  = _v.getCoefficients() * _inv_omega;
@@ -409,16 +496,20 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             _sin_rem = _end_sin;
             _one_minus_cos_rem = _key_end;
 
+            _event_oracle_failed = false;
             _events.clear();
             unsigned int const F = static_cast<unsigned int>(_f_i0.size());
-            for (unsigned int fid = 0; fid < F; ++fid)
+            for (unsigned int fid = 0; fid < F; ++fid) {
                 push_or_update_event(fid);
+                if (_event_oracle_failed) return false;
+            }
+            return true;
         }
 
         // Earliest hit of facet fid in the window (theta_cur, theta_end],
         // as a unit direction plus its ordering key 1 - cos(theta*).
         inline bool next_event_for_facet(unsigned int fid, NT& key_out,
-                                         NT& cos_out, NT& sin_out) const
+                                         NT& cos_out, NT& sin_out)
         {
             VOLESTI_HMC_COUNT(n_trig_calls);
 
@@ -439,11 +530,11 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             NT const val_cur = A * _cur_cos + B * _cur_sin;
             NT const slack = C - val_cur;
             if (slack < -veps) {
-                // The state is on the outer side of this facet (a crossing
-                // was skipped within the eps guard, e.g. at a corner).  Do
-                // not schedule the re-entry crossing as a reflection: free
-                // flight re-enters the polytope on its own, and the facet
-                // is re-solved on the next incident reflection or chunk.
+                // Reaching the outer side means an earlier contact was not
+                // resolved.  Never convert its later re-entry into a valid
+                // trajectory: propagate a numerical failure so the entire
+                // leg is rolled back to its last feasible state.
+                _event_oracle_failed = true;
                 return false;
             }
             if (slack > NT(0)) {
@@ -468,7 +559,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             // exclude its own numerical-residual root at the current angle;
             // for all other facets a nearby forward root is a real crossing
             // and skipping it would leak the trajectory out of the polytope.
-            NT const fwd_eps = (fid == _last_hit_fid) ? _angle_eps : NT(0);
+            NT const fwd_eps = is_last_hit_facet(fid) ? _angle_eps : NT(0);
             NT const limit = _key_end + key_tol();
             bool found = false;
             NT best_key = NT(0), best_cos = NT(0), best_sin = NT(0);
@@ -505,31 +596,143 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             }
         }
 
-        inline bool pop_next_valid_event(unsigned int& fid_out)
+        inline bool pop_next_contact_batch(bool& has_event)
         {
             unsigned int fid;
             NT key;
+            has_event = false;
+            bool found = false;
             while (_events.extract_min_leq(_key_end + key_tol(), fid, key)) {
-                // Discard only events strictly behind the current direction
-                // (possible after FP rounding of coincident roots).  Events
-                // merely *close* ahead are real crossings — near-simultaneous
-                // hits of disjoint facets at corners — and must be reflected,
-                // or the trajectory leaks through the second facet.
+                // Every exact pre-reflection tie should have been removed as
+                // one batch.  A remaining event at or behind the current
+                // direction is therefore unresolved numerical state; reject
+                // the leg instead of silently skipping a possible contact.
                 NT const cross = _cur_cos * _ev_sin[fid] - _cur_sin * _ev_cos[fid];
                 if (cross <= NT(0)) {
                     VOLESTI_HMC_COUNT(n_stale_purge);
-                    continue;
+                    return false;
                 }
-                fid_out = fid;
-                return true;
+                found = true;
+                break;
             }
-            return false;
+
+            if (!found) return true;
+
+            has_event = true;
+            _contact_batch.clear();
+            _contact_batch.push_back(fid);
+
+            NT peek_key;
+            if (!_events.min_key(peek_key) || peek_key > key + key_tol())
+                return true;
+
+            NT const first_cos = _ev_cos[fid];
+            NT const first_sin = _ev_sin[fid];
+            unsigned int const F = static_cast<unsigned int>(_f_i0.size());
+            for (unsigned int candidate = 0; candidate < F; ++candidate) {
+                if (!_events.contains(candidate)) continue;
+                NT const tie_cross = first_cos * _ev_sin[candidate]
+                                   - first_sin * _ev_cos[candidate];
+                NT const tie_dot = first_cos * _ev_cos[candidate]
+                                 + first_sin * _ev_sin[candidate];
+                if (std::abs(tie_cross) <= contact_angle_tol() &&
+                    tie_dot >= NT(1) - contact_angle_tol()) {
+                    _events.remove(candidate);
+                    _contact_batch.push_back(candidate);
+                }
+            }
+            return true;
         }
 
-        // Advance the current position to the popped event's direction.
+        inline bool contact_batch_is_disjoint() const
+        {
+            for (unsigned int i = 0; i < _contact_batch.size(); ++i) {
+                unsigned int const fi = _contact_batch[i];
+                unsigned int const i0 = _f_i0[fi], i1 = _f_i1[fi];
+                for (unsigned int j = i + 1; j < _contact_batch.size(); ++j) {
+                    unsigned int const fj = _contact_batch[j];
+                    unsigned int const j0 = _f_i0[fj], j1 = _f_i1[fj];
+                    if (i0 == j0 || i0 == j1 || i1 == j0 || i1 == j1)
+                        return false;
+                }
+            }
+            return true;
+        }
+
+#ifdef VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
+        // Correctness reference: scan every structured facet independently
+        // of heap state/incident updates.  It deliberately uses the atan2
+        // trigonometric solver rather than the queue's algebraic direction
+        // roots, then returns the complete earliest pre-reflection set.
+        inline bool full_scan_contact_batch(std::vector<unsigned int>& facets,
+                                            NT& cos_out, NT& sin_out) const
+        {
+            facets.clear();
+            bool found = false;
+            NT best_time = std::numeric_limits<NT>::max();
+            unsigned int const F = static_cast<unsigned int>(_f_i0.size());
+            static NT const pi = std::acos(NT(-1));
+            NT const period = NT(2) * pi * _inv_omega;
+            NT const current_angle = std::atan2(_cur_sin, _cur_cos);
+            NT const end_angle = std::atan2(_end_sin, _end_cos);
+            NT const current_time = current_angle * _inv_omega;
+            NT const end_time = end_angle * _inv_omega;
+
+            for (unsigned int fid = 0; fid < F; ++fid) {
+                NT const A = _f_s0[fid] * _alpha(_f_i0[fid])
+                           + _f_s1[fid] * _alpha(_f_i1[fid]);
+                NT const B = _f_s0[fid] * _beta(_f_i0[fid])
+                           + _f_s1[fid] * _beta(_f_i1[fid]);
+                NT const min_time = current_time +
+                    (is_last_hit_facet(fid) ? time_eps() : NT(0));
+                auto const root = first_trigonometric_solution(
+                    A, B, _f_C[fid], _inv_omega, period, min_time,
+                    NT(1e-12), value_tol());
+                if (!root.second || !(root.first > current_time) ||
+                    root.first > end_time + NT(1e-12))
+                    continue;
+
+                NT const angle = _omega * root.first;
+                NT const c = std::cos(angle), s = std::sin(angle);
+                bool tied = false;
+                if (found) {
+                    NT const tie_cross = cos_out * s - sin_out * c;
+                    NT const tie_dot = cos_out * c + sin_out * s;
+                    tied = std::abs(tie_cross) <= contact_angle_tol() &&
+                           tie_dot >= NT(1) - contact_angle_tol();
+                }
+                if (!found || (!tied && root.first < best_time)) {
+                    found = true;
+                    best_time = root.first;
+                    facets.clear();
+                    facets.push_back(fid);
+                    cos_out = c;
+                    sin_out = s;
+                } else if (tied) {
+                    facets.push_back(fid);
+                }
+            }
+
+            if (!found) return false;
+            std::sort(facets.begin(), facets.end());
+            return true;
+        }
+#endif
+
+        // Advance once to the common contact before reflecting the batch.
         inline void accept_event(unsigned int fid)
         {
-            _last_hit_fid = fid;
+            set_last_hit_facet(fid);
+            _cur_cos = _ev_cos[fid];
+            _cur_sin = _ev_sin[fid];
+            _sin_rem = _end_sin * _cur_cos - _end_cos * _cur_sin;
+            _one_minus_cos_rem = NT(1) - (_end_cos * _cur_cos + _end_sin * _cur_sin);
+        }
+
+        inline void accept_contact_batch()
+        {
+            unsigned int const fid = _contact_batch.front();
+            set_last_hit_facets(_contact_batch);
             _cur_cos = _ev_cos[fid];
             _cur_sin = _ev_sin[fid];
             _sin_rem = _end_sin * _cur_cos - _end_cos * _cur_sin;
@@ -562,6 +765,43 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             }
         }
 
+        inline void recompute_incident_facets_batch()
+        {
+            unsigned int count = 0;
+
+            auto mark_vertex = [&](unsigned int vertex) {
+                for (unsigned int idx = _inc_off[vertex]; idx < _inc_off[vertex + 1]; ++idx) {
+                    unsigned int const fid = _inc_ids[idx];
+                    if (!_affected_mask[fid]) {
+                        _affected_mask[fid] = 1;
+                        _affected_list[count++] = fid;
+                    }
+                }
+            };
+
+            for (unsigned int const hit_fid : _contact_batch) {
+                mark_vertex(_f_i0[hit_fid]);
+                if (_f_i1[hit_fid] != _f_i0[hit_fid])
+                    mark_vertex(_f_i1[hit_fid]);
+            }
+
+            for (unsigned int j = 0; j < count; ++j) {
+                unsigned int const fid = _affected_list[j];
+                _affected_mask[fid] = 0;
+                bool was_hit = false;
+                for (unsigned int const hit_fid : _contact_batch) {
+                    if (fid == hit_fid) {
+                        was_hit = true;
+                        break;
+                    }
+                }
+                if (was_hit && _f_C[fid] == NT(0))
+                    _events.remove(fid);
+                else
+                    push_or_update_event(fid);
+            }
+        }
+
         inline void recompute_incident_facets(unsigned int hit_fid)
         {
             unsigned int count = 0;
@@ -583,14 +823,10 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
             for (unsigned int j = 0; j < count; ++j) {
                 unsigned int const fid = _affected_list[j];
                 _affected_mask[fid] = 0;
-                if (fid == hit_fid && _f_C[fid] == NT(0)) {
-                    // After reflecting on A*cos + B*sin = 0 the facet's own
-                    // next root is exactly half a turn away — always beyond
-                    // a quarter-period chunk.
+                if (fid == hit_fid && _f_C[fid] == NT(0))
                     _events.remove(fid);
-                } else {
+                else
                     push_or_update_event(fid);
-                }
             }
         }
 
@@ -601,45 +837,33 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
         }
 
 #ifdef VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
-        // Cross-check the popped event against the full-scan oracle from the
-        // pre-event state (runs before accept_event).
-        inline void verify_event_against_full_scan(Polytope const& P, unsigned int fid)
+        // Cross-check the complete earliest contact set against a full scan
+        // from the same pre-reflection state.
+        inline void verify_contact_batch_against_full_scan(Polytope const& P)
         {
-            Point p_tmp(static_cast<unsigned int>(_alpha.rows()));
-            Point v_tmp(static_cast<unsigned int>(_alpha.rows()));
-            p_tmp.set_coeffs(_alpha * _cur_cos + _beta * _cur_sin);
-            v_tmp.set_coeffs((_beta * _cur_cos - _alpha * _cur_sin) * _omega);
+            (void)P;
+            NT full_cos = NT(0), full_sin = NT(0);
+            bool const found = full_scan_contact_batch(
+                _verify_facets, full_cos, full_sin);
 
-            int prev = -1;
-            auto full = P.trigonometric_positive_intersect(p_tmp, v_tmp, _omega, prev);
-
-            // The pre-event state lies exactly on the last reflected facet,
-            // whose numerical-residual root the oracle reports as a spurious
-            // near-zero hit (it is called with facet_prev == -1).  Re-query
-            // with that facet marked; near-zero hits of *other* facets are
-            // real crossings and must match the popped event.
-            if (full.first <= time_eps() && full.second >= 0 &&
-                _last_hit_fid != no_facet() &&
-                static_cast<unsigned int>(full.second) == _f_row[_last_hit_fid]) {
-                prev = full.second;
-                full = P.trigonometric_positive_intersect(p_tmp, v_tmp, _omega, prev);
-            }
-
-            NT const ec = _ev_cos[fid];
-            NT const es = _ev_sin[fid];
-            NT const dt = std::atan2(_cur_cos * es - _cur_sin * ec,
-                                     _cur_cos * ec + _cur_sin * es) * _inv_omega;
-            // The 1e-13 fallback covers residual grazes of a facet the chunk
-            // end happened to land on exactly (not the last reflected one).
-            bool const ok = full.first == std::numeric_limits<NT>::max() ||
-                            full.first <= NT(1e-13) ||
-                            std::abs(full.first - dt) <= NT(1e-7);
+            std::sort(_contact_batch.begin(), _contact_batch.end());
+            bool const rows_ok = found && _contact_batch == _verify_facets;
+            unsigned int const first = _contact_batch.front();
+            NT const direction_cross = full_cos * _ev_sin[first]
+                                     - full_sin * _ev_cos[first];
+            NT const direction_dot = full_cos * _ev_cos[first]
+                                   + full_sin * _ev_sin[first];
+            bool const direction_ok = found &&
+                std::abs(direction_cross) <= contact_angle_tol() &&
+                direction_dot >= NT(1) - contact_angle_tol();
+            bool const ok = rows_ok && direction_ok;
             if (!ok) {
                 std::fprintf(stderr,
-                    "[verify] fid=%u wall=%d C=%.17g dt=%.17g full=(%.17g, facet %d) "
-                    "cur=(%.17g, %.17g) end=(%.17g, %.17g)\n",
-                    fid, int(_f_wall[fid]), double(_f_C[fid]), double(dt),
-                    double(full.first), full.second,
+                    "[verify] contacts=%zu full_contacts=%zu found=%d "
+                    "dir_cross=%.17g dir_dot=%.17g cur=(%.17g, %.17g) "
+                    "end=(%.17g, %.17g)\n",
+                    _contact_batch.size(), _verify_facets.size(), int(found),
+                    double(direction_cross), double(direction_dot),
                     double(_cur_cos), double(_cur_sin),
                     double(_end_cos), double(_end_sin));
             }
@@ -647,7 +871,28 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
         }
 #endif
 
-        static inline unsigned int no_facet() { return std::numeric_limits<unsigned int>::max(); }
+        inline bool is_last_hit_facet(unsigned int fid) const
+        {
+            return !_last_hit_mask.empty() && _last_hit_mask[fid] != 0;
+        }
+
+        inline void set_last_hit_facets(std::vector<unsigned int> const& facets)
+        {
+            for (unsigned int const fid : _last_hit_facets)
+                _last_hit_mask[fid] = 0;
+            _last_hit_facets.assign(facets.begin(), facets.end());
+            for (unsigned int const fid : _last_hit_facets)
+                _last_hit_mask[fid] = 1;
+        }
+
+        inline void set_last_hit_facet(unsigned int fid)
+        {
+            for (unsigned int const previous : _last_hit_facets)
+                _last_hit_mask[previous] = 0;
+            _last_hit_facets.clear();
+            _last_hit_facets.push_back(fid);
+            _last_hit_mask[fid] = 1;
+        }
 
         // Quarter period in angle units.
         static inline NT chunk_cap() { return NT(1.57079632679489661923); }
@@ -655,7 +900,9 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
         inline NT time_eps() const { return NT(1e-10); }
         inline NT key_tol() const { return NT(1e-12); }
         inline NT value_tol() const { return NT(1e-12); }
-
+        inline NT contact_angle_tol() const {
+            return NT(64) * std::numeric_limits<NT>::epsilon();
+        }
         unsigned int _rho;
         NT _Len;
         Point _p, _v;
@@ -663,17 +910,19 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
         VT _alpha, _beta;
         NT _end_cos, _end_sin, _key_end, _cur_cos, _cur_sin, _sin_rem, _one_minus_cos_rem;
         unsigned int _rebase_interval;
-        // Facet whose reflection produced the current position; its residual
-        // root at the current angle is excluded by the eps guard.  Persists
-        // across chunk and leg boundaries (the state can sit exactly on it).
-        unsigned int _last_hit_fid;
+        trajectory_status _last_status;
+        bool _event_oracle_failed = false;
+        // Facets whose reflection produced the current position.  Their
+        // residual roots at the current angle are excluded by the eps guard.
+        std::vector<unsigned char> _last_hit_mask;
+        std::vector<unsigned int> _last_hit_facets;
+        std::vector<unsigned int> _saved_last_hit_facets;
 
         // Facet data, structure-of-arrays: value along the trajectory is
         // v(theta) = s0*q(i0) + s1*q(i1) for q in {alpha, beta}.
         std::vector<unsigned int> _f_i0, _f_i1;
         std::vector<NT> _f_s0, _f_s1, _f_C;
         std::vector<unsigned char> _f_wall;
-        std::vector<unsigned int> _f_row;
 
         // CSR lists of facets incident to each coordinate.
         std::vector<unsigned int> _inc_off, _inc_ids;
@@ -681,6 +930,10 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalk
         // Pending events: unit direction per facet plus the indexed heap.
         std::vector<NT> _ev_cos, _ev_sin;
         IndexedDHeap _events;
+        std::vector<unsigned int> _contact_batch;
+#ifdef VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
+        std::vector<unsigned int> _verify_facets;
+#endif
         std::vector<unsigned char> _affected_mask;
         std::vector<unsigned int> _affected_list;
     };

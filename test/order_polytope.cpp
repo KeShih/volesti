@@ -693,6 +693,286 @@ TEST_CASE("order_polytope_ghmc_hp_compare") {
     call_test_order_polytope_ghmc_hp_compare<double>();
 }
 
+template <typename NT>
+class ScriptedGaussianRNG {
+public:
+    ScriptedGaussianRNG(std::vector<NT> normal_values,
+                        std::vector<NT> uniform_values)
+        : normals(std::move(normal_values)), uniforms(std::move(uniform_values))
+    {}
+
+    NT sample_ndist() {
+        REQUIRE(normal_index < normals.size());
+        return normals[normal_index++];
+    }
+
+    NT sample_urdist() {
+        REQUIRE(uniform_index < uniforms.size());
+        return uniforms[uniform_index++];
+    }
+
+private:
+    std::vector<NT> normals, uniforms;
+    unsigned int normal_index = 0, uniform_index = 0;
+};
+
+template <typename NT>
+void call_test_order_polytope_ghmc_single_event_equivalence() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels;
+    OP_t OP(Poset(1, rels));
+    Point p(1, std::vector<NT>{NT(0.5)});
+    RNG rng({NT(0), NT(2)}, {NT(0), NT(0.75)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 100, true);
+    Walk walk(OP, p, NT(1), rng, params);
+    walk.apply(OP, p, NT(1), 1, rng);
+
+    CHECK(walk.last_trajectory_status() == Walk::trajectory_status::success);
+    CHECK(OP.is_in(p, NT(1e-10)) == -1);
+    CHECK(p[0] == doctest::Approx(NT(0.08838611995487355)).epsilon(1e-12));
+}
+
+template <typename NT>
+void call_test_order_polytope_ghmc_simultaneous_disjoint_batch() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels;
+    OP_t OP(Poset(2, rels));
+    Point p(2, std::vector<NT>{NT(0.5), NT(0.5)});
+
+    // Constructor: zero velocity and zero time.  apply(): equal coordinate
+    // velocities and T=0.75, producing an exact simultaneous hit of the two
+    // disjoint upper walls.
+    RNG rng({NT(0), NT(0), NT(2), NT(2)}, {NT(0), NT(0.75)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 100, true);
+    Walk walk(OP, p, NT(1), rng, params);
+    walk.apply(OP, p, NT(1), 1, rng);
+
+    CHECK(walk.last_trajectory_status() == Walk::trajectory_status::success);
+    CHECK(OP.is_in(p, NT(1e-10)) == -1);
+    CHECK(p[0] == doctest::Approx(p[1]).epsilon(1e-13));
+    CHECK(p[0] == doctest::Approx(NT(0.08838611995487355)).epsilon(1e-12));
+}
+
+template <typename NT>
+void call_test_order_polytope_ghmc_simultaneous_disjoint_relations() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels{{0, 1}, {2, 3}};
+    OP_t OP(Poset(4, rels));
+    Point p(4, std::vector<NT>{NT(0.25), NT(0.75), NT(0.25), NT(0.75)});
+
+    // The two independent order differences have identical trajectories and
+    // reach zero together.  Their identity-mass reflections swap velocities
+    // on disjoint coordinate pairs, so the joint operation is unambiguous.
+    RNG rng({NT(0), NT(0), NT(0), NT(0),
+             NT(1), NT(-1), NT(1), NT(-1)}, {NT(0), NT(0.75)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 100, true);
+    Walk walk(OP, p, NT(1), rng, params);
+    walk.apply(OP, p, NT(1), 1, rng);
+
+    CHECK(walk.last_trajectory_status() == Walk::trajectory_status::success);
+    CHECK(OP.is_in(p, NT(1e-10)) == -1);
+    CHECK(p[0] == doctest::Approx(p[2]).epsilon(1e-13));
+    CHECK(p[1] == doctest::Approx(p[3]).epsilon(1e-13));
+    CHECK(p[0] < p[1]);
+}
+
+template <typename NT>
+void call_test_order_polytope_ghmc_simultaneous_shared_rollback() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels{{0, 1}};
+    OP_t OP(Poset(2, rels));
+    Point const start(2, std::vector<NT>{NT(0.25), NT(0.5)});
+    Point p = start;
+
+    // x1(t)=2*x0(t), so lower wall x0=0 and relation x0=x1 are
+    // reached together.  Their supports overlap; no reflection ordering is
+    // selected here, and the entire leg must roll back.
+    RNG rng({NT(0), NT(0), NT(-1), NT(-2)}, {NT(0), NT(0.75)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 100, true);
+    Walk walk(OP, p, NT(1), rng, params);
+    walk.apply(OP, p, NT(1), 1, rng);
+
+    CHECK(walk.last_trajectory_status() ==
+          Walk::trajectory_status::shared_coordinate_contact);
+    CHECK(OP.is_in(p, NT(0)) == -1);
+    CHECK(p[0] == doctest::Approx(start[0]));
+    CHECK(p[1] == doctest::Approx(start[1]));
+}
+
+template <typename NT>
+void call_test_order_polytope_ghmc_near_simultaneous_disjoint() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels;
+    OP_t OP(Poset(2, rels));
+    Point p(2, std::vector<NT>{NT(0.5), NT(0.5)});
+    RNG rng({NT(0), NT(0), NT(2), NT(1.999999999)}, {NT(0), NT(0.75)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 100, true);
+    Walk walk(OP, p, NT(1), rng, params);
+    walk.apply(OP, p, NT(1), 1, rng);
+
+    CHECK(walk.last_trajectory_status() == Walk::trajectory_status::success);
+    CHECK(OP.is_in(p, NT(1e-10)) == -1);
+    CHECK(std::abs(p[0] - p[1]) > NT(1e-12));
+    CHECK(p[0] == doctest::Approx(NT(0.08838611995487355)).epsilon(1e-12));
+}
+
+template <typename NT>
+void call_test_order_polytope_ghmc_reflection_limit_rollback() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels;
+    OP_t OP(Poset(2, rels));
+    Point const start(2, std::vector<NT>{NT(0.5), NT(0.5)});
+    Point p = start;
+    RNG rng({NT(0), NT(0), NT(2), NT(2)}, {NT(0), NT(0.75)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 1, true);
+    Walk walk(OP, p, NT(1), rng, params);
+    walk.apply(OP, p, NT(1), 1, rng);
+
+    CHECK(walk.last_trajectory_status() == Walk::trajectory_status::reflection_limit);
+    CHECK(OP.is_in(p, NT(0)) == -1);
+    CHECK(p[0] == doctest::Approx(start[0]));
+    CHECK(p[1] == doctest::Approx(start[1]));
+}
+
+template <typename NT>
+void call_test_order_polytope_ghmc_constructor_failure_rollback() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels{{0, 1}};
+    OP_t OP(Poset(2, rels));
+    Point const start(2, std::vector<NT>{NT(0.25), NT(0.5)});
+    RNG rng({NT(-1), NT(-2)}, {NT(0.75)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 100, true);
+    Walk walk(OP, start, NT(1), rng, params);
+
+    Point p = start;
+    walk.apply(OP, p, NT(1), 0, rng);
+    CHECK(walk.last_trajectory_status() ==
+          Walk::trajectory_status::shared_coordinate_contact);
+    CHECK(OP.is_in(p, NT(0)) == -1);
+    CHECK(p[0] == doctest::Approx(start[0]));
+    CHECK(p[1] == doctest::Approx(start[1]));
+}
+
+template <typename NT>
+void call_test_order_polytope_ghmc_nonfinite_rollback() {
+    typedef Cartesian<NT> Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef ScriptedGaussianRNG<NT> RNG;
+    typedef typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::
+        template Walk<OP_t, RNG> Walk;
+
+    RV rels;
+    OP_t OP(Poset(2, rels));
+    Point const start(2, std::vector<NT>{NT(0.25), NT(0.5)});
+    Point p = start;
+    NT const nan = std::numeric_limits<NT>::quiet_NaN();
+
+    // The constructor consumes the finite zero-velocity leg.  The first
+    // apply leg receives a non-finite velocity and must stop immediately;
+    // no random values are provided for the requested second leg.
+    RNG rng({NT(0), NT(0), nan, NT(1)}, {NT(0), NT(0.5)});
+    typename OrderPolytopeGaussianHamiltonianMonteCarloExactWalk::parameters
+        params(NT(1), true, 100, true);
+    Walk walk(OP, p, NT(1), rng, params);
+    walk.apply(OP, p, NT(1), 2, rng);
+
+    CHECK(walk.last_trajectory_status() ==
+          Walk::trajectory_status::numerical_failure);
+    CHECK(OP.is_in(p, NT(0)) == -1);
+    CHECK(p[0] == doctest::Approx(start[0]));
+    CHECK(p[1] == doctest::Approx(start[1]));
+}
+
+TEST_CASE("order_polytope_ghmc_simultaneous_disjoint_batch") {
+    call_test_order_polytope_ghmc_simultaneous_disjoint_batch<double>();
+}
+
+TEST_CASE("order_polytope_ghmc_single_event_equivalence") {
+    call_test_order_polytope_ghmc_single_event_equivalence<double>();
+}
+
+TEST_CASE("order_polytope_ghmc_simultaneous_disjoint_relations") {
+    call_test_order_polytope_ghmc_simultaneous_disjoint_relations<double>();
+}
+
+TEST_CASE("order_polytope_ghmc_simultaneous_shared_rollback") {
+    call_test_order_polytope_ghmc_simultaneous_shared_rollback<double>();
+}
+
+TEST_CASE("order_polytope_ghmc_near_simultaneous_disjoint") {
+    call_test_order_polytope_ghmc_near_simultaneous_disjoint<double>();
+}
+
+TEST_CASE("order_polytope_ghmc_reflection_limit_rollback") {
+    call_test_order_polytope_ghmc_reflection_limit_rollback<double>();
+}
+
+TEST_CASE("order_polytope_ghmc_constructor_failure_rollback") {
+    call_test_order_polytope_ghmc_constructor_failure_rollback<double>();
+}
+
+TEST_CASE("order_polytope_ghmc_nonfinite_rollback") {
+    call_test_order_polytope_ghmc_nonfinite_rollback<double>();
+}
+
 TEST_CASE("coord_intersect_normalized_shifted") {
     call_test_coord_intersect_normalized_shifted<double>();
 }
