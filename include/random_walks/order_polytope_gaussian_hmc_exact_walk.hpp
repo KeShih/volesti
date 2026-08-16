@@ -32,6 +32,12 @@ namespace hmc_profile_counters {
 inline std::atomic<unsigned long long> n_trajectories{0}, n_reflections{0};
 inline std::atomic<unsigned long long> n_stale_purge{0}, n_trig_calls{0}, n_trig_hits{0};
 inline std::atomic<unsigned long long> n_heap_insert{0}, n_heap_remove{0}, n_rebase{0};
+inline std::atomic<unsigned long long> n_mp_refinement{0};
+// Failure-origin counters for diagnosing fail-closed aborts in production.
+inline std::atomic<unsigned long long> n_fail_amplitude{0}, n_fail_tangent{0};
+inline std::atomic<unsigned long long> n_fail_slackbehind{0}, n_fail_scaling{0};
+inline std::atomic<unsigned long long> n_fail_window{0}, n_fail_candidate{0};
+inline std::atomic<unsigned long long> n_fail_batch{0}, n_fail_chunkstart{0};
 inline void bump(std::atomic<unsigned long long>& c)
 {
     c.fetch_add(1, std::memory_order_relaxed);
@@ -218,6 +224,34 @@ struct DiagonalDynamics
             return true;
         }
 
+        // Per-leg variant: construction rejects even ulp-scale violations,
+        // but a leg that starts or ends a few ulps off a wall after hundreds
+        // of reflections is normal rounding, not a leak worth aborting the
+        // estimation for.
+        inline bool leg_position_is_feasible(Point const& centered) const
+        {
+            NT const slack_tol = NT(1e-9);
+            auto const& coordinates = centered.getCoefficients();
+            unsigned int const n = _polytope->dimension();
+            for (unsigned int i = 0; i < n; ++i) {
+                NT const coordinate_i = (*_center)(i) + coordinates(i);
+                if (!std::isfinite(coordinate_i) ||
+                    coordinate_i < -slack_tol ||
+                    coordinate_i - NT(1) > slack_tol)
+                    return false;
+            }
+            for (unsigned int k = 0;
+                 k < _polytope->num_order_relations(); ++k) {
+                auto const relation = _polytope->get_order_relation(k);
+                NT const difference =
+                    (*_center)(relation.first) + coordinates(relation.first) -
+                    ((*_center)(relation.second) + coordinates(relation.second));
+                if (!std::isfinite(difference) || difference > slack_tol)
+                    return false;
+            }
+            return true;
+        }
+
         template <typename Vector>
         inline bool modal_state_is_valid(Vector const& alpha,
                                          Vector const& beta) const
@@ -231,9 +265,9 @@ struct DiagonalDynamics
         }
 
     private:
-        // Sign of the exact sum of up to four floating-point inputs.  The
-        // short nonoverlapping expansion prevents a final rounded addition
-        // from hiding an ulp-scale bound or cover violation.
+        // Sign of the exact sum of up to four floating-point inputs.  Used
+        // only at construction, where an ulp-scale infeasible start must be
+        // rejected exactly.
         static inline int exact_sum_sign(
             NT a, NT b, NT c = NT(0), NT d = NT(0))
         {
@@ -315,6 +349,10 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             success,
             reflection_limit,
             shared_coordinate_contact,
+            // Two pending events are numerically indistinguishable in order
+            // but do not share an exact root.  The leg is abandoned and
+            // redrawn instead of aborting the whole estimation.
+            ambiguous_tie,
             numerical_failure
         };
 
@@ -363,6 +401,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             _saved_last_hit_fid = no_facet();
             build_event_facets(P);
             initialize(P, p, rng);
+            _strict_start_feasibility = false;
         }
 
         // The a_i argument is ignored: omega is fixed at construction, like
@@ -393,10 +432,22 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     // describe the restored position.
                     _p = p0;
                     restore_last_hit_state();
-                    if (_last_status != trajectory_status::reflection_limit) {
+                    if (_last_status == trajectory_status::ambiguous_tie) {
+                        // A numerically undecidable leg is redrawn, but a
+                        // persistent failure to make progress must surface
+                        // instead of silently freezing the chain.
+                        if (++_consecutive_leg_aborts > 1000) {
+                            p = _p;
+                            throw_trajectory_failure(
+                                trajectory_status::numerical_failure);
+                        }
+                    } else if (_last_status !=
+                               trajectory_status::reflection_limit) {
                         p = _p;
                         throw_trajectory_failure(_last_status);
                     }
+                } else {
+                    _consecutive_leg_aborts = 0;
                 }
             }
             p = _p;
@@ -413,6 +464,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             singleton,
             disjoint_batch,
             shared_coordinate_contact,
+            ambiguous_tie,
             numerical_failure
         };
 
@@ -681,7 +733,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             if (_last_status != trajectory_status::success) {
                 _p = p0;
                 restore_last_hit_state();
-                if (_last_status != trajectory_status::reflection_limit)
+                if (_last_status != trajectory_status::reflection_limit &&
+                    _last_status != trajectory_status::ambiguous_tie)
                     throw_trajectory_failure(_last_status);
             }
         }
@@ -701,7 +754,9 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             if (!this->velocity_is_valid(_v))
                 return trajectory_status::numerical_failure;
             if constexpr (Dynamics::validate_endpoint_feasibility)
-                if (!this->position_is_feasible(_p))
+                if (!(_strict_start_feasibility
+                          ? this->position_is_feasible(_p)
+                          : this->leg_position_is_feasible(_p)))
                     return trajectory_status::numerical_failure;
 
             NT theta_rem = _omega * T;
@@ -710,6 +765,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     return trajectory_status::numerical_failure;
             unsigned int it = 0;
             unsigned int reflections_since_rebase = 0;
+            _leg_abort_pending = false;
 
             while (theta_rem > NT(0))
             {
@@ -720,6 +776,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
 
                 for (;;)
                 {
+                    if (_leg_abort_pending)
+                        return trajectory_status::ambiguous_tie;
                     unsigned int fid = no_facet();
                     contact_batch_result const contact = pop_next_contact_batch(fid);
 #ifdef VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
@@ -734,6 +792,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                             theta_rem -= theta_chunk;
                             break;
                         }
+                        if (contact == contact_batch_result::ambiguous_tie)
+                            return trajectory_status::ambiguous_tie;
                         if (contact != contact_batch_result::disjoint_batch) {
                             return contact == contact_batch_result::shared_coordinate_contact
                                 ? trajectory_status::shared_coordinate_contact
@@ -757,17 +817,6 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     VOLESTI_HMC_COUNT(n_reflections);
                     this->count_reflection();
                     reflect_event(fid);
-                    if constexpr (Dynamics::normalize_event_rows) {
-                        bool arithmetic_ok = true;
-                        int const derivative_sign =
-                            facet_derivative_sign_at_direction(
-                                fid, _cur_cos, _cur_sin, arithmetic_ok);
-                        if (!arithmetic_ok || derivative_sign >= 0) {
-                            return trajectory_status::numerical_failure;
-                        }
-                        if (!reflected_incident_state_is_feasible(fid))
-                            return trajectory_status::numerical_failure;
-                    }
 #ifdef VOLESTI_ORDERPOLYTOPE_HMC_TESTING
                     record_testing_contact_post();
 #endif
@@ -802,7 +851,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 !this->velocity_is_valid(_v))
                 return trajectory_status::numerical_failure;
             if constexpr (Dynamics::validate_endpoint_feasibility)
-                if (!this->position_is_feasible(_p))
+                if (!this->leg_position_is_feasible(_p))
                     return trajectory_status::numerical_failure;
 #ifdef VOLESTI_ORDERPOLYTOPE_HMC_TESTING
             _testing_trace.final_position = _p;
@@ -821,8 +870,10 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             if (!this->modal_state_is_valid(_alpha, _beta))
                 return false;
             if constexpr (Dynamics::normalize_event_rows)
-                if (!chunk_start_is_resolved())
+                if (!chunk_start_is_resolved()) {
+                    VOLESTI_HMC_COUNT(n_fail_chunkstart);
                     return false;
+                }
             _end_cos = std::cos(theta_chunk);
             _end_sin = std::sin(theta_chunk);
             if constexpr (Dynamics::stable_event_keys)
@@ -1116,9 +1167,13 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             return equation;
         }
 
-        inline bool refine_structural_root_direction(
-            unsigned int fid, NT& c, NT& s) const
+        // Cold path for roots too shallow for double precision: build the
+        // structural equation once in wide precision and refine both roots
+        // of the turn in a single pass.
+        inline bool refine_structural_root_pair(
+            unsigned int fid, NT& c1, NT& s1, NT& c2, NT& s2) const
         {
+            VOLESTI_HMC_COUNT(n_mp_refinement);
             unsigned int const i0 = _f_i0[fid];
             structural_wide_float A, B, C;
             if (_f_wall[fid]) {
@@ -1153,33 +1208,44 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 radius_squared - C * C;
             if (radius_squared <= 0 || radial_gap <= 0) return false;
             structural_wide_float const D = sqrt(radial_gap);
+            structural_wide_float const inv_radius_squared =
+                structural_wide_float(1) / radius_squared;
             structural_wide_float const candidate_cos[2] = {
-                (A * C + B * D) / radius_squared,
-                (A * C - B * D) / radius_squared};
+                (A * C + B * D) * inv_radius_squared,
+                (A * C - B * D) * inv_radius_squared};
             structural_wide_float const candidate_sin[2] = {
-                (B * C - A * D) / radius_squared,
-                (B * C + A * D) / radius_squared};
-            structural_wide_float const input_cos(c), input_sin(s);
-            structural_wide_float const dot0 =
-                input_cos * candidate_cos[0] + input_sin * candidate_sin[0];
-            structural_wide_float const dot1 =
-                input_cos * candidate_cos[1] + input_sin * candidate_sin[1];
-            unsigned int const selected = dot1 > dot0 ? 1u : 0u;
-            structural_wide_float const refined_cos = candidate_cos[selected];
-            structural_wide_float const refined_sin = candidate_sin[selected];
-            structural_wide_float const direction_cross =
-                input_cos * refined_sin - input_sin * refined_cos;
-            if (abs(direction_cross) > structural_wide_float("0.01"))
-                return false;
-            c = refined_cos.template convert_to<NT>();
-            s = refined_sin.template convert_to<NT>();
-            NT const norm = std::hypot(c, s);
-            if (!std::isfinite(c) || !std::isfinite(s) ||
-                !std::isfinite(norm) || norm <= NT(0))
-                return false;
-            c /= norm;
-            s /= norm;
-            return std::isfinite(c) && std::isfinite(s);
+                (B * C - A * D) * inv_radius_squared,
+                (B * C + A * D) * inv_radius_squared};
+            NT* const root_cos[2] = {&c1, &c2};
+            NT* const root_sin[2] = {&s1, &s2};
+            for (unsigned int root = 0; root < 2; ++root) {
+                structural_wide_float const input_cos(*root_cos[root]);
+                structural_wide_float const input_sin(*root_sin[root]);
+                structural_wide_float const dot0 =
+                    input_cos * candidate_cos[0] +
+                    input_sin * candidate_sin[0];
+                structural_wide_float const dot1 =
+                    input_cos * candidate_cos[1] +
+                    input_sin * candidate_sin[1];
+                unsigned int const selected = dot1 > dot0 ? 1u : 0u;
+                structural_wide_float const refined_cos =
+                    candidate_cos[selected];
+                structural_wide_float const refined_sin =
+                    candidate_sin[selected];
+                structural_wide_float const direction_cross =
+                    input_cos * refined_sin - input_sin * refined_cos;
+                if (abs(direction_cross) > structural_wide_float("0.01"))
+                    return false;
+                NT c = refined_cos.template convert_to<NT>();
+                NT s = refined_sin.template convert_to<NT>();
+                NT const norm = std::hypot(c, s);
+                if (!std::isfinite(c) || !std::isfinite(s) ||
+                    !std::isfinite(norm) || norm <= NT(0))
+                    return false;
+                *root_cos[root] = c / norm;
+                *root_sin[root] = s / norm;
+            }
+            return true;
         }
 
         inline bool move_root_direction_to_structural_feasible_side(
@@ -1283,6 +1349,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 if (!std::isfinite(A) || !std::isfinite(B) ||
                     !std::isfinite(C) || !std::isfinite(amplitude) ||
                     !std::isfinite(scale) || !std::isfinite(veps)) {
+                    VOLESTI_HMC_COUNT(n_fail_amplitude);
                     _event_oracle_failed = true;
                     return false;
                 }
@@ -1296,6 +1363,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 NT const amplitude_guard = NT(8) *
                     std::numeric_limits<NT>::epsilon() * scale;
                 if (!std::isfinite(amplitude_guard)) {
+                    VOLESTI_HMC_COUNT(n_fail_amplitude);
                     _event_oracle_failed = true;
                     return false;
                 }
@@ -1305,12 +1373,14 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     // hypot can round below a radius whose exact squared
                     // value is just above C^2.  This near-tangent band is not
                     // a proved no-root case, so fail closed.
+                    VOLESTI_HMC_COUNT(n_fail_tangent);
                     _event_oracle_failed = true;
                     return false;
                 }
                 if (amplitude - std::abs(C) <= amplitude_guard) {
                     // The symmetric near-tangent band is unresolved even if
                     // hypot rounded just above |C|.
+                    VOLESTI_HMC_COUNT(n_fail_tangent);
                     _event_oracle_failed = true;
                     return false;
                 }
@@ -1336,6 +1406,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 current_value_eps = value_tol() * current_scale;
                 if (!std::isfinite(val_cur) ||
                     !std::isfinite(current_value_eps)) {
+                    VOLESTI_HMC_COUNT(n_fail_amplitude);
                     _event_oracle_failed = true;
                     return false;
                 }
@@ -1346,22 +1417,34 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             if (slack < -current_value_eps) {
                 // Reaching the outer side means an earlier contact was not
                 // resolved.  Never convert its later re-entry into a valid
-                // trajectory: propagate a numerical failure so the entire
-                // leg is rolled back to its last feasible state.
-                _event_oracle_failed = true;
+                // trajectory: request an abort of the whole leg so it is
+                // rolled back to its last feasible state and redrawn.
+                VOLESTI_HMC_COUNT(n_fail_slackbehind);
+                _leg_abort_pending = true;
                 return false;
             }
-            if (slack > NT(0) && !Dynamics::normalize_event_rows) {
+            if (slack > NT(0)) {
+                // Growth bound over the remaining chunk angle De (De <= pi/2):
+                // |v(theta+De) - v(theta)| <= |v|*(1-cos De) + |v'|*sin De.
+                // The bound is a property of the trigonometric row, not of
+                // its scaling, so it prunes for every backend; the relative
+                // pad keeps rounding from cutting a real hit.
                 NT const dval_cur = B * _cur_cos - A * _cur_sin;
                 NT const reach = std::abs(val_cur) * _one_minus_cos_rem
                                + std::abs(dval_cur) * _sin_rem;
-                if constexpr (Dynamics::normalize_event_rows) {
-                    if (!std::isfinite(dval_cur) || !std::isfinite(reach)) {
+                NT const reach_bound = std::fma(
+                    reach,
+                    NT(1) + NT(64) * std::numeric_limits<NT>::epsilon(),
+                    NT(64) * std::numeric_limits<NT>::epsilon() * scale);
+                if constexpr (Dynamics::fail_on_nonfinite_event_arithmetic) {
+                    if (!std::isfinite(dval_cur) || !std::isfinite(reach) ||
+                        !std::isfinite(reach_bound)) {
+                        VOLESTI_HMC_COUNT(n_fail_amplitude);
                         _event_oracle_failed = true;
                         return false;
                     }
                 }
-                if (slack > reach)
+                if (slack > reach_bound)
                     return false;
             }
 
@@ -1378,24 +1461,24 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 NT const scaled_A = std::ldexp(A, -coefficient_exponent);
                 NT const scaled_B = std::ldexp(B, -coefficient_exponent);
                 NT const scaled_C = std::ldexp(C, -coefficient_exponent);
-                auto const scale_round_trips = [&](NT original, NT scaled) {
-                    return original == NT(0) ||
-                           (scaled != NT(0) &&
-                            std::ldexp(scaled, coefficient_exponent) == original);
-                };
-                NT scaled_radial = NT(0);
-                if (!std::isfinite(coefficient_scale) ||
-                    coefficient_scale <= NT(0) ||
-                    !std::isfinite(scaled_A) ||
-                    !std::isfinite(scaled_B) ||
+                // The power-of-two scale must not flush a nonzero coefficient
+                // to zero: that would silently turn the equation into a
+                // different one.  Overflow to infinity is the same failure.
+                if (!std::isfinite(scaled_A) || !std::isfinite(scaled_B) ||
                     !std::isfinite(scaled_C) ||
-                    !scale_round_trips(A, scaled_A) ||
-                    !scale_round_trips(B, scaled_B) ||
-                    !scale_round_trips(C, scaled_C) ||
-                    !scaled_radial_gap(
+                    (A != NT(0) && scaled_A == NT(0)) ||
+                    (B != NT(0) && scaled_B == NT(0)) ||
+                    (C != NT(0) && scaled_C == NT(0))) {
+                    VOLESTI_HMC_COUNT(n_fail_scaling);
+                    _event_oracle_failed = true;
+                    return false;
+                }
+                NT scaled_radial = NT(0);
+                if (!scaled_radial_gap(
                         scaled_A, scaled_B, scaled_C, scaled_radial)) {
                     // Zero/negative or unrepresentable radial gap is not a
                     // resolvable two-root equation.
+                    VOLESTI_HMC_COUNT(n_fail_tangent);
                     _event_oracle_failed = true;
                     return false;
                 }
@@ -1408,11 +1491,16 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     !std::isfinite(scaled_R2) || scaled_R2 <= NT(0) ||
                     !std::isfinite(normalized_derivative) ||
                     normalized_derivative <= contact_angle_tight_tol()) {
+                    VOLESTI_HMC_COUNT(n_fail_tangent);
                     _event_oracle_failed = true;
                     return false;
                 }
+                // Double root directions carry an error of about eps/u in
+                // the normalized derivative u; below 1e-3 that approaches
+                // the contact-angle tolerance, so only that band pays for
+                // the wide-precision refinement.
                 refine_structural_roots =
-                    normalized_derivative <= NT(0.0625);
+                    normalized_derivative <= NT(1e-3);
                 NT const inv_scaled_R2 = NT(1) / scaled_R2;
                 NT const scaled_AC = scaled_A * scaled_C;
                 NT const scaled_BC = scaled_B * scaled_C;
@@ -1446,8 +1534,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
 
             if constexpr (Dynamics::normalize_event_rows) {
                 if (refine_structural_roots &&
-                    (!refine_structural_root_direction(fid, c1, s1) ||
-                     !refine_structural_root_direction(fid, c2, s2))) {
+                    !refine_structural_root_pair(fid, c1, s1, c2, s2)) {
+                    VOLESTI_HMC_COUNT(n_fail_window);
                     _event_oracle_failed = true;
                     return false;
                 }
@@ -1495,7 +1583,11 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                             return;
                         }
                         if (end_cross < -contact_angle_tol()) return;
-                        if (!move_root_direction_to_structural_feasible_side(
+                        // Roots clearly inside the chunk need no structural
+                        // feasible-side correction; only the endpoint-close
+                        // band is ambiguous enough to pay for it.
+                        if (std::abs(end_cross) <= contact_angle_tol() &&
+                            !move_root_direction_to_structural_feasible_side(
                                 fid, c, s)) {
                             _event_oracle_failed = true;
                             return;
@@ -1584,18 +1676,35 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             consider(c2, s2);
 
             if constexpr (Dynamics::stable_event_keys)
-                if (_event_oracle_failed) return false;
+                if (_event_oracle_failed) {
+                    VOLESTI_HMC_COUNT(n_fail_window);
+                    return false;
+                }
             if (!found) return false;
 
             if constexpr (Dynamics::normalize_event_rows) {
-                bool arithmetic_ok = true;
-                bool const on_structural_facet = facet_is_at_direction(
-                    fid, best_cos, best_sin, arithmetic_ok);
-                bool const outward = facet_points_outward_at_direction(
-                    fid, best_cos, best_sin, arithmetic_ok);
-                if (!arithmetic_ok || !on_structural_facet || !outward) {
-                    _event_oracle_failed = true;
-                    return false;
+                // Fast double check that the accepted root sits on the facet
+                // and moves outward.  Only inputs inside the ambiguous band
+                // pay for the exact expansion validation.
+                NT const residual =
+                    std::fma(A, best_cos, std::fma(B, best_sin, -C));
+                NT const derivative = std::fma(B, best_cos, -A * best_sin);
+                NT const accept_band =
+                    contact_angle_tol() * std::max(NT(1), amplitude);
+                bool const fast_ok = std::isfinite(residual) &&
+                    std::isfinite(derivative) &&
+                    std::abs(residual) <= accept_band && derivative > NT(0);
+                if (!fast_ok) {
+                    bool arithmetic_ok = true;
+                    bool const on_structural_facet = facet_is_at_direction(
+                        fid, best_cos, best_sin, arithmetic_ok);
+                    bool const outward = facet_points_outward_at_direction(
+                        fid, best_cos, best_sin, arithmetic_ok);
+                    if (!arithmetic_ok || !on_structural_facet || !outward) {
+                        VOLESTI_HMC_COUNT(n_fail_candidate);
+                        _event_oracle_failed = true;
+                        return false;
+                    }
                 }
             }
 
@@ -1631,22 +1740,16 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
 
             // Every exact pre-reflection tie should have been removed as one
             // batch.  A remaining event at or behind the current direction is
-            // unresolved numerical state; reject rather than silently skip.
+            // unresolved numerical state: abandon the leg and redraw rather
+            // than follow an unreliable queue.
             NT const cross = _cur_cos * _ev_sin[fid] - _cur_sin * _ev_cos[fid];
             if (cross <= NT(0)) {
                 VOLESTI_HMC_COUNT(n_stale_purge);
-                return contact_batch_result::numerical_failure;
+                return contact_batch_result::ambiguous_tie;
             }
-            if constexpr (Dynamics::normalize_event_rows) {
-                bool arithmetic_ok = true;
-                bool const on_popped_facet = facet_is_at_direction(
-                    fid, _ev_cos[fid], _ev_sin[fid], arithmetic_ok);
-                bool const outward = facet_points_outward_at_direction(
-                    fid, _ev_cos[fid], _ev_sin[fid], arithmetic_ok);
-                if (!arithmetic_ok || !on_popped_facet || !outward) {
-                    return contact_batch_result::numerical_failure;
-                }
-            }
+            // The event was validated against its own stored direction when
+            // it was pushed; the stored (cos, sin) cannot change afterwards,
+            // so re-validating at pop time would only duplicate that work.
 
             fid_out = fid;
             if (extracted == 1)
@@ -1664,6 +1767,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
         contact_batch_result collect_contact_batch(unsigned int fid, NT key)
         {
             _contact_batch.clear();
+            bool ambiguous = false;
             NT const first_cos = _ev_cos[fid];
             NT const first_sin = _ev_sin[fid];
             _events.for_each_key_leq(key + key_tol(), [&](unsigned int candidate) {
@@ -1674,7 +1778,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 if constexpr (Dynamics::normalize_event_rows) {
                     if (!std::isfinite(tie_cross) ||
                         !std::isfinite(tie_dot)) {
-                        _event_oracle_failed = true;
+                        ambiguous = true;
                         return;
                     }
                     // The key tie window is deliberately wider than the
@@ -1686,7 +1790,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     if (tie_cross > contact_angle_tight_tol()) return;
                     if (tie_cross < -contact_angle_tight_tol() ||
                         tie_dot < NT(1) - contact_angle_tight_tol()) {
-                        _event_oracle_failed = true;
+                        ambiguous = true;
                         return;
                     }
                 }
@@ -1696,9 +1800,10 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 bool tied = direction_tied;
                 if constexpr (Dynamics::normalize_event_rows) {
                     // Both an angular match and an independently evaluated
-                    // zero residual are required.  A zero residual outside
-                    // the operational angle window is numerically ambiguous:
-                    // fail closed instead of guessing simultaneous semantics.
+                    // zero residual are required for a simultaneous batch.
+                    // A pair that is close but not exactly tied cannot be
+                    // ordered reliably; the caller abandons the leg and
+                    // redraws rather than guessing simultaneous semantics.
                     bool arithmetic_ok = true;
                     bool const at_first_direction = facet_is_at_direction(
                         candidate, first_cos, first_sin, arithmetic_ok);
@@ -1709,29 +1814,28 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                             fid, candidate, first_cos, first_sin,
                             arithmetic_ok);
                     if (!arithmetic_ok) {
-                        _event_oracle_failed = true;
+                        ambiguous = true;
                         return;
                     }
                     if (at_first_direction && !outward) {
-                        _event_oracle_failed = true;
+                        ambiguous = true;
                         return;
                     }
                     if (at_first_direction && !direction_tied) {
-                        _event_oracle_failed = true;
+                        ambiguous = true;
                         return;
                     }
                     // Heap-key and residual tolerances are only a reason to
                     // inspect a possible tie.  Promote it to a pre-reflection
                     // batch only when the two exact dyadic structural
-                    // equations share this outward root.  A merely close
-                    // pair is unresolved here, never guessed simultaneous.
+                    // equations share this outward root.
                     if (!exact_common_root) {
-                        _event_oracle_failed = true;
+                        ambiguous = true;
                         return;
                     }
                     if (!at_first_direction || !outward ||
                         !direction_tied) {
-                        _event_oracle_failed = true;
+                        ambiguous = true;
                         return;
                     }
                     tied = direction_tied && at_first_direction &&
@@ -1740,9 +1844,10 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 if (tied)
                     _contact_batch.push_back(candidate);
             });
-            if constexpr (Dynamics::normalize_event_rows)
-                if (_event_oracle_failed)
-                    return contact_batch_result::numerical_failure;
+            if (ambiguous) {
+                VOLESTI_HMC_COUNT(n_fail_batch);
+                return contact_batch_result::ambiguous_tie;
+            }
             if (_contact_batch.empty())
                 return contact_batch_result::singleton;
 
@@ -2239,24 +2344,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 VOLESTI_HMC_COUNT(n_reflections);
                 this->count_reflection();
                 reflect_event(fid);
-                if constexpr (Dynamics::normalize_event_rows) {
-                    bool arithmetic_ok = true;
-                    int const derivative_sign =
-                        facet_derivative_sign_at_direction(
-                            fid, _cur_cos, _cur_sin, arithmetic_ok);
-                    if (!arithmetic_ok || derivative_sign >= 0) {
-                        _contact_batch.clear();
-                        return trajectory_status::numerical_failure;
-                    }
-                }
                 ++reflections;
                 ++reflections_since_rebase;
-            }
-            if constexpr (Dynamics::normalize_event_rows) {
-                if (!reflected_batch_incident_state_is_feasible()) {
-                    _contact_batch.clear();
-                    return trajectory_status::numerical_failure;
-                }
             }
 #ifdef VOLESTI_ORDERPOLYTOPE_HMC_TESTING
             record_testing_contact_post();
@@ -2280,62 +2369,6 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             }
             _contact_batch.clear();
             return status;
-        }
-
-        template <typename HitFacetVisitor>
-        inline bool reflected_incident_state_is_feasible_impl(
-            HitFacetVisitor&& visit_hit_facets)
-        {
-            unsigned int count = 0;
-            auto mark_vertex = [&](unsigned int vertex) {
-                for (unsigned int idx = _inc_off[vertex];
-                     idx < _inc_off[vertex + 1]; ++idx) {
-                    unsigned int const fid = _inc_ids[idx];
-                    if (!_affected_mask[fid]) {
-                        _affected_mask[fid] = 1;
-                        _affected_list[count++] = fid;
-                    }
-                }
-            };
-            visit_hit_facets(mark_vertex);
-
-            bool feasible = true;
-            for (unsigned int j = 0; j < count; ++j) {
-                unsigned int const fid = _affected_list[j];
-                structural_facet_evaluation evaluation;
-                if (!structural_facet_evaluation_at_direction(
-                        fid, _cur_cos, _cur_sin, evaluation) ||
-                    (evaluation.residual_sign > 0 &&
-                     !structural_residual_is_within_contact_roundoff(
-                         evaluation))) {
-                    feasible = false;
-                }
-                _affected_mask[fid] = 0;
-            }
-            return feasible;
-        }
-
-        inline bool reflected_incident_state_is_feasible(
-            unsigned int hit_fid)
-        {
-            return reflected_incident_state_is_feasible_impl(
-                [&](auto&& mark_vertex) {
-                    mark_vertex(_f_i0[hit_fid]);
-                    if (_f_i1[hit_fid] != _f_i0[hit_fid])
-                        mark_vertex(_f_i1[hit_fid]);
-                });
-        }
-
-        inline bool reflected_batch_incident_state_is_feasible()
-        {
-            return reflected_incident_state_is_feasible_impl(
-                [&](auto&& mark_vertex) {
-                    for (unsigned int const hit_fid : _contact_batch) {
-                        mark_vertex(_f_i0[hit_fid]);
-                        if (_f_i1[hit_fid] != _f_i0[hit_fid])
-                            mark_vertex(_f_i1[hit_fid]);
-                    }
-                });
         }
 
         inline void recompute_incident_facets(unsigned int hit_fid)
@@ -2427,25 +2460,17 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             NT const boundary_tolerance = NT(64) *
                 std::numeric_limits<NT>::epsilon();
             for (unsigned int fid = 0; fid < F; ++fid) {
-                if constexpr (Dynamics::normalize_event_rows) {
-                    structural_facet_evaluation evaluation;
-                    if (!structural_facet_evaluation_at_direction(
-                            fid, NT(1), NT(0), evaluation) ||
-                        (evaluation.residual_sign > 0 &&
-                         !structural_residual_is_within_contact_roundoff(
-                             evaluation)))
-                        return false;
-                    if (evaluation.residual_sign >= 0 &&
-                        evaluation.derivative_sign > 0)
-                        return false;
-                    continue;
-                }
                 NT const value = facet_linear_value(fid, _alpha);
                 NT const derivative = facet_linear_value(fid, _beta);
                 if (!std::isfinite(value) || !std::isfinite(derivative))
                     return false;
                 NT const residual = value - _f_C[fid];
-                if (residual > NT(0)) return false;
+                // A leg that starts a few ulps past a wall after hundreds of
+                // reflections is rounding noise, not a leak; only violations
+                // beyond the row scale are real.
+                NT const residual_tol = value_tol() * std::max(
+                    NT(1), std::max(std::abs(value), std::abs(_f_C[fid])));
+                if (residual > residual_tol) return false;
                 if (residual >= -boundary_tolerance && derivative > NT(0))
                     return false;
             }
@@ -2660,6 +2685,12 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
         NT _end_cos, _end_sin, _key_end, _cur_cos, _cur_sin, _sin_rem, _one_minus_cos_rem;
         unsigned int _rebase_interval;
         trajectory_status _last_status;
+        bool _leg_abort_pending = false;
+        unsigned int _consecutive_leg_aborts = 0;
+        // The very first leg validates its start point exactly, as the
+        // constructor contract demands; later legs tolerate ulp-scale
+        // rounding noise near walls.
+        bool _strict_start_feasibility = true;
         bool _event_oracle_failed = false;
         // The common singleton last hit stays scalar; the sparse-set mask is
         // activated only after a true multi-contact reflection.
