@@ -29,6 +29,7 @@
 #include "random_walks/gaussian_accelerated_billiard_walk.hpp"
 #include "random_walks/gaussian_hamiltonian_monte_carlo_exact_walk.hpp"
 #include "random_walks/order_polytope_gaussian_hmc_exact_walk.hpp"
+#include "random_walks/order_polytope_gaussian_hmc_matched_walk.hpp"
 #include "random_walks/exponential_hamiltonian_monte_carlo_exact_walk.hpp"
 #include "random_walks/uniform_accelerated_billiard_walk_parallel.hpp"
 #include "random_walks/hamiltonian_monte_carlo_walk.hpp"

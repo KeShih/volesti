@@ -111,4 +111,7 @@ else ()
   add_executable (order_polytope order_polytope.cpp)
   TARGET_LINK_LIBRARIES(order_polytope ${LP_SOLVE})
 
+  add_executable (log_linear_extensions log_linear_extensions.cpp)
+  TARGET_LINK_LIBRARIES(log_linear_extensions ${LP_SOLVE})
+
 endif()

@@ -742,3 +742,301 @@ void call_test_event_queue_facets() {
 TEST_CASE("event_queue_facets") {
     call_test_event_queue_facets<double>();
 }
+
+
+// ---- Event-queue hardening tests -------------------------------------
+//
+// The velocities below are built from the 3-4-5 triple so that the
+// algebraic root computation of next_event_for_facet lands on the unit
+// direction (cos, sin) = (0.6, 0.8) bit-exactly for several facets at
+// once (all intermediate products, discriminants and square roots are
+// exact dyadics), producing *exactly* simultaneous crossing events.
+// All tests use a = 0.5, i.e. omega = sqrt(2a) = 1, so trajectory time
+// equals trajectory angle.
+
+template <typename NT>
+void call_test_eq_simultaneous_lower_facets() {
+    typedef Cartesian<NT>    Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef BoostRandomNumberGenerator<boost::mt19937, NT, 3> RNGType;
+    typedef OrderPolytopeGaussianHamiltonianMonteCarloExactWalk WalkPolicy;
+    typedef typename WalkPolicy::template Walk<OP_t, RNGType> Walk;
+
+    RV rels;
+    Poset poset(2, rels);
+    OP_t OP(poset);
+    RNGType rng(2);
+
+    NT const a = NT(0.5);
+    Point start(2, {NT(0.5), NT(0.5)});
+    Walk walk(OP, start, a, rng);
+
+    // x_i(theta) = 0.5 cos - 0.375 sin for both coordinates: both lower
+    // facets are crossed at exactly the same angle (0.6, 0.8).  Both
+    // reflections must happen; dropping the tied second event leaks the
+    // unreflected coordinate to -0.375 by the quarter period.
+    Point p = start;
+    Point v(2, {NT(-0.375), NT(-0.375)});
+    NT const T = NT(1.57079632679489661923);
+    CHECK(walk.apply_leg(OP, p, v, T));
+    CHECK(OP.is_in(p, NT(1e-9)) == -1);
+    // Reflected speed is 0.625, so both coordinates end at
+    // 0.625 * sin(pi/2 - theta*) = 0.625 * 0.6 = 0.375.
+    CHECK(std::abs(p[0] - NT(0.375)) < NT(1e-9));
+    CHECK(std::abs(p[1] - NT(0.375)) < NT(1e-9));
+}
+
+template <typename NT>
+void call_test_eq_simultaneous_upper_facets() {
+    typedef Cartesian<NT>    Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef BoostRandomNumberGenerator<boost::mt19937, NT, 5> RNGType;
+    typedef OrderPolytopeGaussianHamiltonianMonteCarloExactWalk WalkPolicy;
+    typedef typename WalkPolicy::template Walk<OP_t, RNGType> Walk;
+
+    RV rels;
+    Poset poset(2, rels);
+    OP_t OP(poset);
+    RNGType rng(2);
+
+    NT const a = NT(0.5);
+    Point start(2, {NT(0.5), NT(0.5)});
+    Walk walk(OP, start, a, rng);
+
+    // x_i(theta) = 0.5 cos + 0.875 sin reaches 1 at (0.6, 0.8) for both
+    // coordinates simultaneously.  T = 1.05 ends the leg while a leaked
+    // (unreflected) coordinate is still above 1: its sinusoid re-enters
+    // only at theta ~ 1.176.
+    Point p = start;
+    Point v(2, {NT(0.875), NT(0.875)});
+    NT const T = NT(1.05);
+    CHECK(walk.apply_leg(OP, p, v, T));
+    CHECK(OP.is_in(p, NT(1e-9)) == -1);
+    // After reflection the facet-normal speed flips to -0.125:
+    // x(T) = cos(T - theta*) - 0.125 sin(T - theta*).
+    NT const theta_star = std::atan2(NT(0.8), NT(0.6));
+    NT const rem = T - theta_star;
+    NT const expected = std::cos(rem) - NT(0.125) * std::sin(rem);
+    CHECK(std::abs(p[0] - expected) < NT(1e-9));
+    CHECK(std::abs(p[1] - expected) < NT(1e-9));
+}
+
+template <typename NT>
+void call_test_eq_simultaneous_cover_and_bound() {
+    typedef Cartesian<NT>    Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef BoostRandomNumberGenerator<boost::mt19937, NT, 11> RNGType;
+    typedef OrderPolytopeGaussianHamiltonianMonteCarloExactWalk WalkPolicy;
+    typedef typename WalkPolicy::template Walk<OP_t, RNGType> Walk;
+
+    // Chain 0 < 1 < 2: facets are lb(0), ub(2) and the two covers.
+    RV rels{{0, 1}, {1, 2}};
+    Poset poset(3, rels);
+    OP_t OP(poset);
+    RNGType rng(3);
+
+    NT const a = NT(0.5);
+    Point start(3, {NT(0.25), NT(0.375), NT(0.5)});
+    Walk walk(OP, start, a, rng);
+
+    // At (0.6, 0.8) the cover facet x0 <= x1 and the disjoint bound facet
+    // x2 <= 1 are hit at exactly the same angle:
+    //   x0 - x1 = -0.125 cos + 0.09375 sin  (root (0.6, 0.8) bit-exact)
+    //   x2      =  0.5   cos + 0.875   sin  (reaches 1 at (0.6, 0.8))
+    // The cover reflection swaps the velocities of coordinates 0 and 1;
+    // the bound reflection flips the velocity of coordinate 2.  Both must
+    // fire regardless of heap tie order.
+    Point p = start;
+    Point v(3, {NT(0.34375), NT(0.25), NT(0.875)});
+    NT const T = NT(1.57079632679489661923);
+    CHECK(walk.apply_leg(OP, p, v, T));
+    CHECK(OP.is_in(p, NT(1e-9)) == -1);
+    // At the hit, x0 = x1 = 0.425 and x2 = 1.  Remaining angle is
+    // pi/2 - theta*, with cos = 0.8 and sin = 0.6.  Angular velocities
+    // after the reflections: x0' = -0.15, x1' = 0.00625 (swapped by the
+    // cover), x2' = -0.125 (flipped by the bound):
+    //   x0(T) = 0.425 * 0.8 - 0.15    * 0.6 = 0.25
+    //   x1(T) = 0.425 * 0.8 + 0.00625 * 0.6 = 0.34375
+    //   x2(T) = 1.0   * 0.8 - 0.125   * 0.6 = 0.725
+    CHECK(std::abs(p[0] - NT(0.25)) < NT(1e-9));
+    CHECK(std::abs(p[1] - NT(0.34375)) < NT(1e-9));
+    CHECK(std::abs(p[2] - NT(0.725)) < NT(1e-9));
+}
+
+template <typename NT>
+void call_test_eq_boundary_new_leg() {
+    typedef Cartesian<NT>    Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef BoostRandomNumberGenerator<boost::mt19937, NT, 17> RNGType;
+    typedef OrderPolytopeGaussianHamiltonianMonteCarloExactWalk WalkPolicy;
+    typedef typename WalkPolicy::template Walk<OP_t, RNGType> Walk;
+
+    RV rels;
+    Poset poset(1, rels);
+    OP_t OP(poset);
+    RNGType rng(1);
+
+    NT const a = NT(0.5);
+    NT const T = NT(1.57079632679489661923);
+    Point start(1, {NT(0.5)});
+    Walk walk(OP, start, a, rng);
+
+    // Leg 1 reflects on the lower facet at (0.6, 0.8) and ends inside,
+    // leaving that facet as the walk's internal last-hit facet.
+    Point p = start;
+    Point v1(1, {NT(-0.375)});
+    CHECK(walk.apply_leg(OP, p, v1, T));
+    CHECK(std::abs(p[0] - NT(0.375)) < NT(1e-9));
+
+    // Leg 2 starts exactly ON that facet with outward velocity.  The
+    // momentum refresh must clear the residual-root guard: the walk
+    // reflects at t = 0 and ends at +0.75 instead of drifting to -0.75.
+    Point p2(1, {NT(0)});
+    Point v2(1, {NT(-0.75)});
+    CHECK(walk.apply_leg(OP, p2, v2, T));
+    CHECK(OP.is_in(p2, NT(1e-12)) == -1);
+    CHECK(std::abs(p2[0] - NT(0.75)) < NT(1e-9));
+
+    // Inward from the same boundary state: no reflection may fire (the
+    // root at t = 0 is the incoming one); the leg ends at +0.25.
+    Point p3(1, {NT(0)});
+    Point v3(1, {NT(0.25)});
+    CHECK(walk.apply_leg(OP, p3, v3, T));
+    CHECK(std::abs(p3[0] - NT(0.25)) < NT(1e-9));
+}
+
+template <typename NT>
+void call_test_eq_hard_negative_slack() {
+    typedef Cartesian<NT>    Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef BoostRandomNumberGenerator<boost::mt19937, NT, 19> RNGType;
+    typedef OrderPolytopeGaussianHamiltonianMonteCarloExactWalk WalkPolicy;
+    typedef typename WalkPolicy::template Walk<OP_t, RNGType> Walk;
+
+    RV rels;
+    Poset poset(1, rels);
+    OP_t OP(poset);
+    RNGType rng(1);
+
+    NT const a = NT(0.5);
+    Point start(1, {NT(0.5)});
+    Walk walk(OP, start, a, rng);
+    CHECK(walk.hard_negative_slack_count() == 0);
+
+    // A state clearly outside the polytope is a containment violation the
+    // solver must report, not silently self-heal.
+    Point p(1, {NT(-0.5)});
+    Point v(1, {NT(0.3)});
+    walk.apply_leg(OP, p, v, NT(0.5));
+    CHECK(walk.hard_negative_slack_count() > 0);
+}
+
+template <typename NT>
+void call_test_eq_stable_angle_key() {
+    // Below theta ~ 1e-8, cos(theta) rounds to exactly 1 and the naive
+    // 1 - cos key collapses to 0 for all such angles; the stable form
+    // keeps distinct events strictly ordered.
+    NT s1 = NT(1e-9), s2 = NT(2e-9);
+    NT c1 = std::sqrt(NT(1) - s1 * s1);
+    NT c2 = std::sqrt(NT(1) - s2 * s2);
+    CHECK(NT(1) - c1 == NT(1) - c2);   // naive keys collapse
+    CHECK(order_polytope_hmc_detail::one_minus_cos_stable(c1, s1) >
+          NT(0));
+    CHECK(order_polytope_hmc_detail::one_minus_cos_stable(c1, s1) <
+          order_polytope_hmc_detail::one_minus_cos_stable(c2, s2));
+
+    // Strictly monotone across a sweep of tiny angles.
+    NT prev = NT(0);
+    for (NT s = NT(1e-9); s < NT(2e-6); s *= NT(2)) {
+        NT c = std::sqrt(NT(1) - s * s);
+        NT k = order_polytope_hmc_detail::one_minus_cos_stable(c, s);
+        CHECK(k > prev);
+        prev = k;
+    }
+
+    // Agrees with the naive form away from small angles.
+    CHECK(order_polytope_hmc_detail::one_minus_cos_stable(NT(0.8), NT(0.6)) ==
+          doctest::Approx(NT(0.2)));
+    CHECK(order_polytope_hmc_detail::one_minus_cos_stable(NT(-0.3),
+          std::sqrt(NT(1) - NT(0.09))) == doctest::Approx(NT(1.3)));
+}
+
+template <typename NT>
+void call_test_eq_long_run_containment() {
+    typedef Cartesian<NT>    Kernel;
+    typedef typename Kernel::Point Point;
+    typedef OrderPolytope<Point> OP_t;
+    typedef typename Poset::RV RV;
+    typedef BoostRandomNumberGenerator<boost::mt19937, NT, 23> RNGType;
+
+    // Chain posets pack the stationary mass into corner-like states where
+    // several facets are near-active at once — the regime that historically
+    // leaked.  The sharper Gaussian (a = 5) presses the walk into corners.
+    std::vector<std::pair<unsigned int, RV>> posets;
+    {
+        RV chain;
+        for (unsigned int i = 0; i + 1 < 12; ++i) chain.push_back({i, i + 1});
+        posets.push_back({12, chain});
+    }
+    posets.push_back({4, RV{{0, 1}, {0, 2}, {1, 3}, {2, 3}}});     // diamond
+    posets.push_back({8, RV{{0, 2}, {1, 2}, {2, 5}, {3, 5}, {1, 4},
+                            {4, 6}, {5, 7}}});                     // sparse
+
+    for (auto& pr : posets) {
+        Poset poset(pr.first, pr.second);
+        OP_t OP(poset);
+        unsigned int d = OP.dimension();
+
+        for (NT aa : {NT(1), NT(5)}) {
+            Point start(OP.inner_point());
+            RNGType rng(d);
+            std::list<Point> randPoints;
+            gaussian_sampling<OrderPolytopeGaussianHamiltonianMonteCarloExactWalk>(
+                randPoints, OP, rng, 1, 1500, aa, start, 2);
+
+            CHECK(randPoints.size() == 1500);
+            unsigned int violations = 0;
+            for (auto const& q : randPoints)
+                if (OP.is_in(q, NT(1e-7)) != -1) ++violations;
+            CHECK(violations == 0);
+        }
+    }
+}
+
+TEST_CASE("event_queue_simultaneous_lower_facets") {
+    call_test_eq_simultaneous_lower_facets<double>();
+}
+
+TEST_CASE("event_queue_simultaneous_upper_facets") {
+    call_test_eq_simultaneous_upper_facets<double>();
+}
+
+TEST_CASE("event_queue_simultaneous_cover_and_bound") {
+    call_test_eq_simultaneous_cover_and_bound<double>();
+}
+
+TEST_CASE("event_queue_boundary_new_leg") {
+    call_test_eq_boundary_new_leg<double>();
+}
+
+TEST_CASE("event_queue_hard_negative_slack") {
+    call_test_eq_hard_negative_slack<double>();
+}
+
+TEST_CASE("event_queue_stable_angle_key") {
+    call_test_eq_stable_angle_key<double>();
+}
+
+TEST_CASE("event_queue_long_run_containment") {
+    call_test_eq_long_run_containment<double>();
+}
