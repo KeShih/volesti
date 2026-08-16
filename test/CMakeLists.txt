@@ -407,6 +407,40 @@ add_test(NAME le_reduction_exact_dp COMMAND linear_extensions_volume_test -tc=or
 add_test(NAME le_reduction_residual COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_residual_fallback)
 add_test(NAME le_reduction_options COMMAND linear_extensions_volume_test -tc=order_polytope_volume_reduction_options)
 
+add_executable (diagonal_rounding_test
+        order_polytope_diagonal_rounding_test.cpp $<TARGET_OBJECTS:test_main>)
+target_compile_definitions(diagonal_rounding_test PRIVATE
+        VOLESTI_ORDERPOLYTOPE_HMC_TESTING)
+add_executable (diagonal_rounding_verifier_test
+        order_polytope_diagonal_rounding_test.cpp $<TARGET_OBJECTS:test_main>)
+target_compile_definitions(diagonal_rounding_verifier_test PRIVATE
+        VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
+        VOLESTI_ORDERPOLYTOPE_HMC_TESTING)
+add_test(NAME diagonal_rounding_metric_validation
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_metric_validation)
+add_test(NAME diagonal_rounding_quadratic_distances
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_quadratic_distances)
+add_test(NAME diagonal_rounding_normalizer
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_normalizer)
+add_test(NAME diagonal_rounding_reflection
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_reflection)
+add_test(NAME diagonal_rounding_velocity_refresh
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_velocity_refresh)
+add_test(NAME diagonal_rounding_identity_equivalence
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_identity_equivalence)
+add_test(NAME diagonal_rounding_identity_equivalence_verifier
+        COMMAND diagonal_rounding_verifier_test -tc=diagonal_rounding_identity_equivalence)
+add_test(NAME diagonal_rounding_event_queue_full_scan
+        COMMAND diagonal_rounding_verifier_test -tc=diagonal_rounding_event_queue_full_scan)
+add_test(NAME diagonal_rounding_feasibility
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_feasibility)
+add_test(NAME diagonal_rounding_counting_exact
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_counting_exact)
+add_test(NAME diagonal_rounding_residual_vertex_maps
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_residual_vertex_maps)
+add_test(NAME diagonal_rounding_counting_residual
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_counting_residual)
+
 add_executable (matrix_sampling_test sampling_correlation_matrices_test.cpp $<TARGET_OBJECTS:test_main>)
 add_test(NAME test_corre_spectra_classes COMMAND matrix_sampling_test -tc=corre_spectra)
 add_test(NAME test_new_ball_uniform COMMAND matrix_sampling_test -tc=new_ball_uniform)
@@ -495,6 +529,8 @@ TARGET_LINK_LIBRARIES(logconcave_sampling_test lp_solve ${IFOPT} ${IFOPT_IPOPT} 
 TARGET_LINK_LIBRARIES(crhmc_sampling_test lp_solve ${IFOPT} ${IFOPT_IPOPT} ${PTHREAD} ${GMP} ${MPSOLVE} ${FFTW3} ${MKL_LINK} QD_LIB coverage_config)
 TARGET_LINK_LIBRARIES(order_polytope lp_solve coverage_config)
 TARGET_LINK_LIBRARIES(linear_extensions_volume_test lp_solve ${MKL_LINK} coverage_config)
+TARGET_LINK_LIBRARIES(diagonal_rounding_test lp_solve ${MKL_LINK} coverage_config)
+TARGET_LINK_LIBRARIES(diagonal_rounding_verifier_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(matrix_sampling_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(test_internal_points lp_solve ${MKL_LINK} coverage_config)
 find_package(LAPACK REQUIRED)

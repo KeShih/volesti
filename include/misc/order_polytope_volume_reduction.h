@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <vector>
 
 #include "misc/poset.h"
@@ -52,6 +53,15 @@ struct ReducedOrderPolytopeVolumeProblem {
     std::vector<OrderPolytopeReductionStep> steps;
 
     bool is_exact() const { return residual_posets.empty(); }
+};
+
+struct MappedReducedOrderPolytopeVolumeProblem {
+    ReducedOrderPolytopeVolumeProblem problem;
+    // residual_vertices[r][i] is the original input-poset vertex represented
+    // by coordinate i of residual_posets[r].  The parallel/ordinal reducers
+    // reindex induced subposets, so consumers carrying per-coordinate data
+    // must use this map rather than assuming residual indices are original.
+    std::vector<std::vector<unsigned int> > residual_vertices;
 };
 
 namespace order_polytope_volume_reduction_detail {
@@ -254,11 +264,20 @@ inline void add_step(ReducedOrderPolytopeVolumeProblem& result,
     result.steps.push_back({kind, input_size, sizes, contribution});
 }
 
+template <bool RetainVertexMaps>
 inline void reduce_recursive(Poset const& P,
+                             std::vector<unsigned int> const* original_vertices,
                              OrderPolytopeVolumeReductionOptions const& options,
-                             ReducedOrderPolytopeVolumeProblem& result)
+                             ReducedOrderPolytopeVolumeProblem& result,
+                             std::vector<std::vector<unsigned int> >*
+                                 residual_vertices)
 {
     unsigned int n = P.num_elem();
+    if constexpr (RetainVertexMaps) {
+        if (!original_vertices || original_vertices->size() != n)
+            throw std::invalid_argument(
+                "order-polytope reduction vertex map has wrong dimension");
+    }
 
     if (n == 0) {
         add_step(result, OrderPolytopeReductionStepKind::ExactEmpty, n, {}, 0.0);
@@ -295,7 +314,18 @@ inline void reduce_recursive(Poset const& P,
 
             for (auto const& comp : components) {
                 Poset sub = induced_poset(reach, comp, options.transitive_reduce_residuals);
-                reduce_recursive(sub, options, result);
+                if constexpr (RetainVertexMaps) {
+                    std::vector<unsigned int> sub_vertices;
+                    sub_vertices.reserve(comp.size());
+                    for (unsigned int vertex : comp)
+                        sub_vertices.push_back((*original_vertices)[vertex]);
+                    reduce_recursive<true>(
+                        sub, &sub_vertices, options, result,
+                        residual_vertices);
+                } else {
+                    reduce_recursive<false>(
+                        sub, nullptr, options, result, nullptr);
+                }
             }
             return;
         }
@@ -318,7 +348,18 @@ inline void reduce_recursive(Poset const& P,
 
             for (auto const& block : ordered) {
                 Poset sub = induced_poset(reach, block, options.transitive_reduce_residuals);
-                reduce_recursive(sub, options, result);
+                if constexpr (RetainVertexMaps) {
+                    std::vector<unsigned int> sub_vertices;
+                    sub_vertices.reserve(block.size());
+                    for (unsigned int vertex : block)
+                        sub_vertices.push_back((*original_vertices)[vertex]);
+                    reduce_recursive<true>(
+                        sub, &sub_vertices, options, result,
+                        residual_vertices);
+                } else {
+                    reduce_recursive<false>(
+                        sub, nullptr, options, result, nullptr);
+                }
             }
             return;
         }
@@ -338,6 +379,12 @@ inline void reduce_recursive(Poset const& P,
     for (unsigned int i = 0; i < n; ++i) vertices[i] = i;
     result.residual_posets.push_back(
         induced_poset(reach, vertices, options.transitive_reduce_residuals));
+    if constexpr (RetainVertexMaps) {
+        if (!residual_vertices)
+            throw std::runtime_error(
+                "order-polytope reduction is missing its vertex-map sink");
+        residual_vertices->push_back(*original_vertices);
+    }
     add_step(result, OrderPolytopeReductionStepKind::ResidualCore, n, {}, 0.0);
 }
 
@@ -348,7 +395,26 @@ inline ReducedOrderPolytopeVolumeProblem reduce_order_polytope_volume_problem(
     OrderPolytopeVolumeReductionOptions const& options = OrderPolytopeVolumeReductionOptions())
 {
     ReducedOrderPolytopeVolumeProblem result;
-    order_polytope_volume_reduction_detail::reduce_recursive(P, options, result);
+    order_polytope_volume_reduction_detail::reduce_recursive<false>(
+        P, nullptr, options, result, nullptr);
+    return result;
+}
+
+// Explicit opt-in variant for consumers carrying per-coordinate data through
+// recursive residual reindexing.  The default reducer above retains its prior
+// result type and allocation behavior.
+inline MappedReducedOrderPolytopeVolumeProblem
+reduce_order_polytope_volume_problem_with_vertex_maps(
+    Poset const& P,
+    OrderPolytopeVolumeReductionOptions const& options =
+        OrderPolytopeVolumeReductionOptions())
+{
+    MappedReducedOrderPolytopeVolumeProblem result;
+    std::vector<unsigned int> original_vertices(P.num_elem());
+    for (unsigned int i = 0; i < P.num_elem(); ++i) original_vertices[i] = i;
+    order_polytope_volume_reduction_detail::reduce_recursive<true>(
+        P, &original_vertices, options, result.problem,
+        &result.residual_vertices);
     return result;
 }
 

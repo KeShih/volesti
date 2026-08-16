@@ -1,5 +1,6 @@
 .. VolEsti documentation master file, created by
    sphinx-quickstart on Mon Jun 27 11:31:02 2022.
+   Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
@@ -19,6 +20,7 @@ Welcome to VolEsti's documentation!
 
    tutorials/general.md
    tutorials/logconcave.md
+   tutorials/order_polytope_diagonal_rounding.md
 
 .. toctree::
    :caption: C++ API Reference
