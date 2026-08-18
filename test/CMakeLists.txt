@@ -416,6 +416,8 @@ add_executable (diagonal_rounding_verifier_test
 target_compile_definitions(diagonal_rounding_verifier_test PRIVATE
         VOLESTI_VERIFY_ORDERPOLYTOPE_EVENT_QUEUE
         VOLESTI_ORDERPOLYTOPE_HMC_TESTING)
+add_executable (order_polytope_diagonal_rounding_benchmark EXCLUDE_FROM_ALL
+        order_polytope_diagonal_rounding_benchmark.cpp)
 add_test(NAME diagonal_rounding_metric_validation
         COMMAND diagonal_rounding_test -tc=diagonal_rounding_metric_validation)
 add_test(NAME diagonal_rounding_quadratic_distances
@@ -432,6 +434,10 @@ add_test(NAME diagonal_rounding_identity_equivalence_verifier
         COMMAND diagonal_rounding_verifier_test -tc=diagonal_rounding_identity_equivalence)
 add_test(NAME diagonal_rounding_event_queue_full_scan
         COMMAND diagonal_rounding_verifier_test -tc=diagonal_rounding_event_queue_full_scan)
+add_test(NAME diagonal_rounding_failure_semantics
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_failure_semantics)
+add_test(NAME diagonal_rounding_exact_final_gate
+        COMMAND diagonal_rounding_test -tc=diagonal_rounding_exact_final_gate)
 add_test(NAME diagonal_rounding_feasibility
         COMMAND diagonal_rounding_test -tc=diagonal_rounding_feasibility)
 add_test(NAME diagonal_rounding_counting_exact
@@ -531,6 +537,8 @@ TARGET_LINK_LIBRARIES(order_polytope lp_solve coverage_config)
 TARGET_LINK_LIBRARIES(linear_extensions_volume_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(diagonal_rounding_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(diagonal_rounding_verifier_test lp_solve ${MKL_LINK} coverage_config)
+TARGET_LINK_LIBRARIES(order_polytope_diagonal_rounding_benchmark
+        lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(matrix_sampling_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(test_internal_points lp_solve ${MKL_LINK} coverage_config)
 find_package(LAPACK REQUIRED)

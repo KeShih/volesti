@@ -140,6 +140,32 @@ OrderPolytopeVolumeReductionOptions exact_dp_options()
     return options;
 }
 
+// Test-only dynamics that makes the third exact feasibility query fail.  A
+// zero-time constructor performs the first two queries (start and final), and
+// the next zero-time apply reaches the final sample-release gate.  This keeps
+// the regression independent of event-root roundoff.
+struct FinalEndpointGateProbeDynamics
+    : order_polytope_exact_hmc_detail::DiagonalDynamics {
+    template <typename Polytope>
+    struct State
+        : order_polytope_exact_hmc_detail::DiagonalDynamics::State<Polytope> {
+        typedef order_polytope_exact_hmc_detail::DiagonalDynamics::State<Polytope>
+            Base;
+        typedef typename Polytope::PointType PointType;
+
+        explicit State(Polytope const& polytope) : Base(polytope) {}
+
+        bool position_is_feasible(PointType const& point) const
+        {
+            ++exact_feasibility_queries;
+            return exact_feasibility_queries <= 2 &&
+                   Base::position_is_feasible(point);
+        }
+
+        mutable unsigned int exact_feasibility_queries = 0;
+    };
+};
+
 } // namespace
 
 TEST_CASE("diagonal_rounding_metric_validation")
@@ -1601,6 +1627,154 @@ TEST_CASE("diagonal_rounding_event_queue_full_scan")
               << maximum_reflection_error << '\n';
 }
 
+TEST_CASE("diagonal_rounding_failure_semantics")
+{
+    typedef DiagonalRoundingOrderPolytope<Point, true> DiagnosticBody;
+    typedef OrderPolytopeDiagonalGaussianHamiltonianMonteCarloExactWalk Policy;
+    typedef Policy::Walk<DiagnosticBody, ScriptedGaussianRNG> Walk;
+
+    // A reflection-limit hit is a rejected transition: it rolls back, remains
+    // feasible, and can be observed without turning into a thrown failure.
+    {
+        Poset antichain = make_poset(2, Poset::RV{});
+        OP original(antichain);
+        Point center = make_point({0.5, 0.5});
+        OrderPolytopeDiagonalRounding<Point> metric(
+            original, center, make_vector({1.0, 1.0}));
+        OrderPolytopeDiagonalCoolingDiagnostics<double> diagnostics;
+        DiagnosticBody body(original, metric, &diagnostics);
+        Point initial(2), point = initial;
+        ScriptedGaussianRNG rng(
+            {0.0, 0.0, 2.0, 2.0, 2.0, 2.0},
+            {0.0, 0.75, 0.75});
+        Policy::parameters parameters(1.0, true, 1, true);
+        Walk walk(body, point, 0.5, rng, parameters);
+
+        CHECK_NOTHROW(walk.apply(body, point, 0.5, 1, rng));
+        CHECK(walk.last_trajectory_status() ==
+              Walk::trajectory_status::reflection_limit);
+        CHECK(max_point_difference(point, initial) == 0.0);
+        CHECK(body.is_in(point) == -1);
+        CHECK(diagnostics.rejected_reflection_limit == 1);
+
+        // Repeating the same rejected proposal verifies that rollback did not
+        // leave a stale contact state that changes the next transition.
+        CHECK_NOTHROW(walk.apply(body, point, 0.5, 1, rng));
+        CHECK(walk.last_trajectory_status() ==
+              Walk::trajectory_status::reflection_limit);
+        CHECK(max_point_difference(point, initial) == 0.0);
+        CHECK(diagnostics.rejected_reflection_limit == 2);
+    }
+
+    // A numerically inseparable but non-common root is a hard failure.  It
+    // must not silently return the original point as a successful sample.
+    {
+        Poset antichain = make_poset(2, Poset::RV{});
+        OP original(antichain);
+        Point center = make_point({0.5, 0.5});
+        OrderPolytopeDiagonalRounding<Point> metric(
+            original, center, make_vector({1.0, 1.0}));
+        OrderPolytopeDiagonalCoolingDiagnostics<double> diagnostics;
+        DiagnosticBody body(original, metric, &diagnostics);
+        double const first_angle = std::acos(-1.0) / 6.0;
+        double const second_angle = first_angle + 5e-15;
+        Point initial(2), point = initial;
+        ScriptedGaussianRNG rng(
+            {0.0, 0.0,
+             0.5 / std::sin(second_angle),
+             0.5 / std::sin(first_angle)},
+            {0.0, 0.8});
+        Policy::parameters parameters(1.0, true, 100, true);
+        Walk walk(body, point, 0.5, rng, parameters);
+
+        CHECK_THROWS_WITH_AS(
+            walk.apply(body, point, 0.5, 1, rng),
+            doctest::Contains("ambiguous simultaneous-event tie"),
+            std::runtime_error);
+        CHECK(walk.last_trajectory_status() ==
+              Walk::trajectory_status::ambiguous_tie);
+        CHECK(max_point_difference(point, initial) == 0.0);
+        CHECK(diagnostics.ambiguous_tie_failures == 1);
+        CHECK(diagnostics.shared_contact_failures == 0);
+    }
+
+    // Shared-coordinate simultaneous contacts retain the explicit fail-hard
+    // policy, with rollback and a separate semantic counter.
+    {
+        Poset chain = make_poset(2, Poset::RV{{0, 1}});
+        OP original(chain);
+        Point center = make_point({0.25, 0.5});
+        OrderPolytopeDiagonalRounding<Point> metric(
+            original, center, make_vector({0.25, 4.0}));
+        OrderPolytopeDiagonalCoolingDiagnostics<double> diagnostics;
+        DiagnosticBody body(original, metric, &diagnostics);
+        Point initial(2), point = initial;
+        ScriptedGaussianRNG rng(
+            {0.0, 0.0, -2.0, -1.0}, {0.0, 0.8});
+        Policy::parameters parameters(1.0, true, 100, true);
+        Walk walk(body, point, 0.5, rng, parameters);
+
+        CHECK_THROWS_WITH_AS(
+            walk.apply(body, point, 0.5, 1, rng),
+            doctest::Contains("shared-coordinate"), std::runtime_error);
+        CHECK(walk.last_trajectory_status() ==
+              Walk::trajectory_status::shared_coordinate_contact);
+        CHECK(max_point_difference(point, initial) == 0.0);
+        CHECK(diagnostics.shared_contact_failures == 1);
+        CHECK(diagnostics.ambiguous_tie_failures == 0);
+    }
+}
+
+TEST_CASE("diagonal_rounding_exact_final_gate")
+{
+    Poset singleton = make_poset(1, Poset::RV{});
+    OP original(singleton);
+    Point center = make_point({0.5});
+    OrderPolytopeDiagonalRounding<Point> metric(
+        original, center, make_vector({1.0}));
+
+    // The ordinary tolerance check accepts this represented coordinate because
+    // center + centered rounds to 1.  The exact-sign predicate still detects
+    // that the binary inputs sum to a value strictly above the wall.
+    {
+        OrderPolytopeDiagonalCoolingDiagnostics<double> diagnostics;
+        DiagonalRoundingOrderPolytope<Point, true> body(
+            original, metric, &diagnostics);
+        order_polytope_exact_hmc_detail::DiagonalDynamics::State<
+            DiagonalRoundingOrderPolytope<Point, true>> state(body);
+        Point outside = make_point(
+            {std::nextafter(0.5,
+                            std::numeric_limits<double>::infinity())});
+        CHECK(state.leg_position_is_feasible(outside));
+        CHECK_FALSE(state.position_is_feasible(outside));
+        state.observe_endpoint_violations(outside);
+        CHECK(diagnostics.max_observed_bound_violation > 0.0);
+        CHECK(diagnostics.max_observed_cover_violation == 0.0);
+    }
+
+    // Exercise the actual final gate independently of root finding.  The
+    // constructor's zero-time leg passes; the next zero-time leg is rejected
+    // only when advance_event_queue asks the exact final predicate again.
+    {
+        typedef DiagonalRoundingOrderPolytope<Point> Body;
+        typedef OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy<
+            FinalEndpointGateProbeDynamics> ProbePolicy;
+        typedef ProbePolicy::Walk<Body, ScriptedGaussianRNG> ProbeWalk;
+        Body body(original, metric);
+        Point initial(1), point = initial;
+        ScriptedGaussianRNG rng({0.0, 0.0}, {0.0, 0.0});
+        ProbePolicy::parameters parameters(0.0, true, 100, true);
+        ProbeWalk walk(body, point, 0.5, rng, parameters);
+        CHECK_THROWS_WITH_AS(
+            walk.apply(body, point, 0.5, 1, rng),
+            doctest::Contains("numerical event failure"),
+            std::runtime_error);
+        CHECK(walk.last_trajectory_status() ==
+              ProbeWalk::trajectory_status::numerical_failure);
+        CHECK(max_point_difference(point, initial) == 0.0);
+    }
+}
+
 TEST_CASE("diagonal_rounding_feasibility")
 {
     Poset poset = make_poset(
@@ -2112,6 +2286,16 @@ TEST_CASE("diagonal_rounding_counting_residual")
     CHECK(nonuniform_diagnostics.reflection_count() > 0);
     CHECK(identity_diagnostics.event_recomputation_count() > 0);
     CHECK(nonuniform_diagnostics.event_recomputation_count() > 0);
+    CHECK(identity_diagnostics.rejected_reflection_limit() == 0);
+    CHECK(nonuniform_diagnostics.rejected_reflection_limit() == 0);
+    CHECK(identity_diagnostics.ambiguous_tie_failures() == 0);
+    CHECK(nonuniform_diagnostics.ambiguous_tie_failures() == 0);
+    CHECK(identity_diagnostics.shared_contact_failures() == 0);
+    CHECK(nonuniform_diagnostics.shared_contact_failures() == 0);
+    CHECK(identity_diagnostics.max_observed_bound_violation() == 0.0);
+    CHECK(nonuniform_diagnostics.max_observed_bound_violation() == 0.0);
+    CHECK(identity_diagnostics.max_observed_cover_violation() == 0.0);
+    CHECK(nonuniform_diagnostics.max_observed_cover_violation() == 0.0);
     REQUIRE(nonuniform_diagnostics.residual_cooling.size() == 1);
     gaussian_annealing_parameters<double> annealing_parameters(4);
     std::vector<double> expected_nonuniform_a0;

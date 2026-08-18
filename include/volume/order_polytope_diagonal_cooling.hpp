@@ -284,7 +284,8 @@ void compute_annealing_schedule(Polytope& polytope,
 
 } // namespace order_polytope_diagonal_cooling_detail
 
-template <bool EnableDiagnostics, typename Point, typename RandomNumberGenerator>
+template <bool EnableDiagnostics, typename WalkPolicy,
+          typename Point, typename RandomNumberGenerator>
 OrderPolytopeDiagonalCoolingResult<typename Point::FT>
 volume_cooling_gaussians_order_polytope_diagonal_implementation(
     OrderPolytope<Point> const& input_polytope,
@@ -296,8 +297,8 @@ volume_cooling_gaussians_order_polytope_diagonal_implementation(
 {
     typedef typename Point::FT NT;
     typedef DiagonalRoundingOrderPolytope<Point, EnableDiagnostics> Polytope;
-    typedef typename OrderPolytopeDiagonalGaussianHamiltonianMonteCarloExactWalk::
-        template Walk<Polytope, RandomNumberGenerator> WalkType;
+    typedef typename WalkPolicy::template Walk<
+        Polytope, RandomNumberGenerator> WalkType;
     typedef GaussianRandomPointGenerator<WalkType> RandomPointGenerator;
 
     if (!std::isfinite(error) || error <= 0.0 || walk_length == 0)
@@ -450,9 +451,11 @@ volume_cooling_gaussians_order_polytope_diagonal_result(
     OrderPolytopeDiagonalCoolingDiagnostics<typename Point::FT>* diagnostics = nullptr)
 {
     if (diagnostics)
-        return volume_cooling_gaussians_order_polytope_diagonal_implementation<true>(
+        return volume_cooling_gaussians_order_polytope_diagonal_implementation<
+            true, OrderPolytopeDiagonalGaussianHamiltonianMonteCarloExactWalk>(
             input_polytope, rng, metric, error, walk_length, diagnostics);
-    return volume_cooling_gaussians_order_polytope_diagonal_implementation<false>(
+    return volume_cooling_gaussians_order_polytope_diagonal_implementation<
+        false, OrderPolytopeDiagonalGaussianHamiltonianMonteCarloExactWalk>(
         input_polytope, rng, metric, error, walk_length, nullptr);
 }
 

@@ -34,6 +34,11 @@ struct OrderPolytopeDiagonalCoolingDiagnostics {
     unsigned long long ratio_trajectories = 0;
     unsigned long long reflection_count = 0;
     unsigned long long event_recomputation_count = 0;
+    unsigned long long rejected_reflection_limit = 0;
+    unsigned long long ambiguous_tie_failures = 0;
+    unsigned long long shared_contact_failures = 0;
+    NT max_observed_bound_violation = NT(0);
+    NT max_observed_cover_violation = NT(0);
     double cooling_microseconds = 0.0;
     OrderPolytopeDiagonalCoolingStage active_stage =
         OrderPolytopeDiagonalCoolingStage::Schedule;
@@ -91,6 +96,48 @@ struct OrderPolytopeDiagonalRoundingDiagnostics {
         for (auto const& diagnostic : residual_cooling)
             total += diagnostic.event_recomputation_count;
         return total;
+    }
+
+    unsigned long long rejected_reflection_limit() const
+    {
+        unsigned long long total = 0;
+        for (auto const& diagnostic : residual_cooling)
+            total += diagnostic.rejected_reflection_limit;
+        return total;
+    }
+
+    unsigned long long ambiguous_tie_failures() const
+    {
+        unsigned long long total = 0;
+        for (auto const& diagnostic : residual_cooling)
+            total += diagnostic.ambiguous_tie_failures;
+        return total;
+    }
+
+    unsigned long long shared_contact_failures() const
+    {
+        unsigned long long total = 0;
+        for (auto const& diagnostic : residual_cooling)
+            total += diagnostic.shared_contact_failures;
+        return total;
+    }
+
+    NT max_observed_bound_violation() const
+    {
+        NT maximum = NT(0);
+        for (auto const& diagnostic : residual_cooling)
+            maximum = std::max(
+                maximum, diagnostic.max_observed_bound_violation);
+        return maximum;
+    }
+
+    NT max_observed_cover_violation() const
+    {
+        NT maximum = NT(0);
+        for (auto const& diagnostic : residual_cooling)
+            maximum = std::max(
+                maximum, diagnostic.max_observed_cover_violation);
+        return maximum;
     }
 
     double cooling_microseconds() const

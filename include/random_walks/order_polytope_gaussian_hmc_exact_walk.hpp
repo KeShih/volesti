@@ -78,6 +78,8 @@ struct SphericalDynamics
     static constexpr bool normalize_event_rows = false;
     static constexpr bool stable_event_keys = false;
     static constexpr bool reset_last_hit_on_velocity_refresh = false;
+    static constexpr bool fail_hard_on_ambiguous_tie = false;
+    static constexpr bool report_failure_diagnostics = false;
 
     template <typename Polytope>
     struct State
@@ -105,6 +107,10 @@ struct SphericalDynamics
         inline void count_trajectory() const {}
         inline void count_reflection() const {}
         inline void count_event_recomputation() const {}
+        inline void count_reflection_limit_rejection() const {}
+        inline void count_ambiguous_tie_failure() const {}
+        inline void count_shared_contact_failure() const {}
+        inline void observe_endpoint_violations(Point const&) const {}
         inline bool velocity_is_valid(Point const&) const { return true; }
         inline bool position_is_feasible(Point const&) const { return true; }
         template <typename Vector>
@@ -122,6 +128,8 @@ struct DiagonalDynamics
     static constexpr bool normalize_event_rows = true;
     static constexpr bool stable_event_keys = true;
     static constexpr bool reset_last_hit_on_velocity_refresh = true;
+    static constexpr bool fail_hard_on_ambiguous_tie = true;
+    static constexpr bool report_failure_diagnostics = true;
 
     template <typename Polytope>
     struct State
@@ -188,6 +196,77 @@ struct DiagonalDynamics
                 ++_diagnostics->event_recomputation_count;
         }
 
+        inline void count_reflection_limit_rejection() const
+        {
+            if constexpr (Polytope::rounding_diagnostics_enabled)
+                ++_diagnostics->rejected_reflection_limit;
+        }
+
+        inline void count_ambiguous_tie_failure() const
+        {
+            if constexpr (Polytope::rounding_diagnostics_enabled)
+                ++_diagnostics->ambiguous_tie_failures;
+        }
+
+        inline void count_shared_contact_failure() const
+        {
+            if constexpr (Polytope::rounding_diagnostics_enabled)
+                ++_diagnostics->shared_contact_failures;
+        }
+
+        inline void observe_endpoint_violations(Point const& centered) const
+        {
+            if constexpr (Polytope::rounding_diagnostics_enabled) {
+                auto const& coordinates = centered.getCoefficients();
+                NT max_bound = NT(0), max_cover = NT(0);
+                NT const smallest_positive =
+                    std::numeric_limits<NT>::denorm_min() > NT(0)
+                        ? std::numeric_limits<NT>::denorm_min()
+                        : std::numeric_limits<NT>::min();
+                unsigned int const n = _polytope->dimension();
+                for (unsigned int i = 0; i < n; ++i) {
+                    NT const center_i = (*_center)(i);
+                    NT const coordinate_i = coordinates(i);
+                    int const lower_sign = exact_sum_sign(
+                        center_i, coordinate_i);
+                    int const upper_sign = exact_sum_sign(
+                        center_i, coordinate_i, NT(-1));
+                    if (lower_sign < 0) {
+                        NT magnitude = -(center_i + coordinate_i);
+                        max_bound = std::max(
+                            max_bound, magnitude > NT(0)
+                                           ? magnitude : smallest_positive);
+                    }
+                    if (upper_sign > 0) {
+                        NT magnitude = center_i + coordinate_i - NT(1);
+                        max_bound = std::max(
+                            max_bound, magnitude > NT(0)
+                                           ? magnitude : smallest_positive);
+                    }
+                }
+                for (unsigned int k = 0;
+                     k < _polytope->num_order_relations(); ++k) {
+                    auto const relation = _polytope->get_order_relation(k);
+                    NT const center_u = (*_center)(relation.first);
+                    NT const coordinate_u = coordinates(relation.first);
+                    NT const center_v = (*_center)(relation.second);
+                    NT const coordinate_v = coordinates(relation.second);
+                    if (exact_sum_sign(center_u, coordinate_u,
+                                       -center_v, -coordinate_v) > 0) {
+                        NT magnitude = center_u + coordinate_u -
+                                       center_v - coordinate_v;
+                        max_cover = std::max(
+                            max_cover, magnitude > NT(0)
+                                           ? magnitude : smallest_positive);
+                    }
+                }
+                _diagnostics->max_observed_bound_violation = std::max(
+                    _diagnostics->max_observed_bound_violation, max_bound);
+                _diagnostics->max_observed_cover_violation = std::max(
+                    _diagnostics->max_observed_cover_violation, max_cover);
+            }
+        }
+
         inline bool velocity_is_valid(Point const& velocity) const
         {
             return velocity.getCoefficients().allFinite();
@@ -224,10 +303,9 @@ struct DiagonalDynamics
             return true;
         }
 
-        // Per-leg variant: construction rejects even ulp-scale violations,
-        // but a leg that starts or ends a few ulps off a wall after hundreds
-        // of reflections is normal rounding, not a leak worth aborting the
-        // estimation for.
+        // Internal per-leg start check.  Event classification may tolerate
+        // small roundoff while refining a trajectory, but the final sample
+        // is guarded separately by position_is_feasible() with exact signs.
         inline bool leg_position_is_feasible(Point const& centered) const
         {
             NT const slack_tol = NT(1e-9);
@@ -266,8 +344,7 @@ struct DiagonalDynamics
 
     private:
         // Sign of the exact sum of up to four floating-point inputs.  Used
-        // only at construction, where an ulp-scale infeasible start must be
-        // rejected exactly.
+        // at construction and at the final sample-release gate.
         static inline int exact_sum_sign(
             NT a, NT b, NT c = NT(0), NT d = NT(0))
         {
@@ -350,8 +427,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             reflection_limit,
             shared_coordinate_contact,
             // Two pending events are numerically indistinguishable in order
-            // but do not share an exact root.  The leg is abandoned and
-            // redrawn instead of aborting the whole estimation.
+            // but do not share an exact root.  The diagonal policy treats
+            // this as a hard numerical failure before any reflection.
             ambiguous_tie,
             numerical_failure
         };
@@ -433,16 +510,31 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     _p = p0;
                     restore_last_hit_state();
                     if (_last_status == trajectory_status::ambiguous_tie) {
-                        // A numerically undecidable leg is redrawn, but a
-                        // persistent failure to make progress must surface
-                        // instead of silently freezing the chain.
-                        if (++_consecutive_leg_aborts > 1000) {
+                        if constexpr (Dynamics::fail_hard_on_ambiguous_tie) {
+                            if constexpr (Dynamics::report_failure_diagnostics)
+                                this->count_ambiguous_tie_failure();
                             p = _p;
-                            throw_trajectory_failure(
-                                trajectory_status::numerical_failure);
+                            throw_trajectory_failure(_last_status);
+                        } else {
+                            // Preserve the established spherical behavior:
+                            // this transition is a rollback/self-loop.  A
+                            // later walk_length iteration, if any, is an
+                            // independent transition rather than a retry.
+                            if (++_consecutive_leg_aborts > 1000) {
+                                p = _p;
+                                throw_trajectory_failure(
+                                    trajectory_status::numerical_failure);
+                            }
                         }
-                    } else if (_last_status !=
+                    } else if (_last_status ==
                                trajectory_status::reflection_limit) {
+                        if constexpr (Dynamics::report_failure_diagnostics)
+                            this->count_reflection_limit_rejection();
+                    } else {
+                        if constexpr (Dynamics::report_failure_diagnostics)
+                            if (_last_status ==
+                                trajectory_status::shared_coordinate_contact)
+                                this->count_shared_contact_failure();
                         p = _p;
                         throw_trajectory_failure(_last_status);
                     }
@@ -733,9 +825,22 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             if (_last_status != trajectory_status::success) {
                 _p = p0;
                 restore_last_hit_state();
-                if (_last_status != trajectory_status::reflection_limit &&
-                    _last_status != trajectory_status::ambiguous_tie)
+                if (_last_status == trajectory_status::reflection_limit) {
+                    if constexpr (Dynamics::report_failure_diagnostics)
+                        this->count_reflection_limit_rejection();
+                } else if (_last_status == trajectory_status::ambiguous_tie) {
+                    if constexpr (Dynamics::fail_hard_on_ambiguous_tie) {
+                        if constexpr (Dynamics::report_failure_diagnostics)
+                            this->count_ambiguous_tie_failure();
+                        throw_trajectory_failure(_last_status);
+                    }
+                } else {
+                    if constexpr (Dynamics::report_failure_diagnostics)
+                        if (_last_status ==
+                            trajectory_status::shared_coordinate_contact)
+                            this->count_shared_contact_failure();
                     throw_trajectory_failure(_last_status);
+                }
             }
         }
 
@@ -850,9 +955,11 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
             if (!_p.getCoefficients().allFinite() ||
                 !this->velocity_is_valid(_v))
                 return trajectory_status::numerical_failure;
-            if constexpr (Dynamics::validate_endpoint_feasibility)
-                if (!this->leg_position_is_feasible(_p))
+            if constexpr (Dynamics::validate_endpoint_feasibility) {
+                this->observe_endpoint_violations(_p);
+                if (!this->position_is_feasible(_p))
                     return trajectory_status::numerical_failure;
+            }
 #ifdef VOLESTI_ORDERPOLYTOPE_HMC_TESTING
             _testing_trace.final_position = _p;
             _testing_trace.final_velocity = _v;
@@ -1418,7 +1525,7 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 // Reaching the outer side means an earlier contact was not
                 // resolved.  Never convert its later re-entry into a valid
                 // trajectory: request an abort of the whole leg so it is
-                // rolled back to its last feasible state and redrawn.
+                // rolled back to its last feasible state and reported.
                 VOLESTI_HMC_COUNT(n_fail_slackbehind);
                 _leg_abort_pending = true;
                 return false;
@@ -1740,8 +1847,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
 
             // Every exact pre-reflection tie should have been removed as one
             // batch.  A remaining event at or behind the current direction is
-            // unresolved numerical state: abandon the leg and redraw rather
-            // than follow an unreliable queue.
+            // unresolved numerical state: abort the leg rather than follow
+            // an unreliable queue.
             NT const cross = _cur_cos * _ev_sin[fid] - _cur_sin * _ev_cos[fid];
             if (cross <= NT(0)) {
                 VOLESTI_HMC_COUNT(n_stale_purge);
@@ -1802,8 +1909,8 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                     // Both an angular match and an independently evaluated
                     // zero residual are required for a simultaneous batch.
                     // A pair that is close but not exactly tied cannot be
-                    // ordered reliably; the caller abandons the leg and
-                    // redraws rather than guessing simultaneous semantics.
+                    // ordered reliably; the caller fails rather than guessing
+                    // simultaneous semantics.
                     bool arithmetic_ok = true;
                     bool const at_first_direction = facet_is_at_direction(
                         candidate, first_cos, first_sin, arithmetic_ok);
@@ -2657,6 +2764,11 @@ struct OrderPolytopeGaussianHamiltonianMonteCarloExactWalkPolicy
                 throw std::runtime_error(
                     "OrderPolytope exact HMC encountered an unresolved "
                     "shared-coordinate simultaneous contact");
+            if constexpr (Dynamics::fail_hard_on_ambiguous_tie)
+                if (status == trajectory_status::ambiguous_tie)
+                    throw std::runtime_error(
+                        "OrderPolytope exact HMC encountered an ambiguous "
+                        "simultaneous-event tie");
             throw std::runtime_error(
                 "OrderPolytope exact HMC encountered a numerical event failure");
         }

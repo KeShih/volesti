@@ -89,10 +89,52 @@ fail-closed behavior.
 
 Diagnostics are optional. Per residual they record metric setup time, initial
 $a_0$, cooling phase count, schedule and ratio-loop trajectory counts,
-reflections, event recomputations, total cooling time, and microseconds per
-trajectory. The counting-level diagnostics also report total estimator time
-and aggregate the residual counters. Supplying no diagnostics selects a
-compile-time uninstrumented diagonal walk, so event-loop counters are absent.
+reflections, event recomputations, reflection-limit rejections, ambiguous-tie
+failures, shared-contact failures, the largest observed bound and cover
+violations, total cooling time, and microseconds per trajectory. The
+counting-level diagnostics also report total estimator time and aggregate the
+residual counters. Supplying no diagnostics selects a compile-time
+uninstrumented diagonal walk, so event-loop counters are absent.
+
+Trajectory failures have explicit semantics. Reaching the configured
+reflection limit rolls the position and contact state back and records a
+rejected transition. A numerically ambiguous event tie and a simultaneous
+contact whose facets share a coordinate both roll back and throw; neither is
+returned as a successful self-loop. Internal root classification may use
+floating-point tolerances, but the final sample-release gate evaluates the
+stored coordinates with exact floating-point expansion signs. Any
+representable bound or cover violation therefore fails before the point is
+handed to the cooling estimator.
+
+## Isolated benchmark
+
+The optional CMake target
+`order_polytope_diagonal_rounding_benchmark` separates the backend cost from
+the coordinate-scaling benefit:
+
+- `S`: spherical event/reflection dynamics with the same supplied center and
+  an identity target shape;
+- `D0`: diagonal dynamics with $D=I$;
+- `D1`: diagonal dynamics with a precomputed $D$ normalized so that
+  $(\prod_i d_i)^{1/n}=1$.
+
+Build and run it explicitly; it is excluded from the default test build:
+
+```bash
+cmake --build test/build \
+  --target order_polytope_diagonal_rounding_benchmark -j8
+./test/build/order_polytope_diagonal_rounding_benchmark 3 0.3 1 \
+  > diagonal_rounding_raw.csv 2> diagonal_rounding_summary.txt
+```
+
+The CSV records $a_0$, phase and trajectory counts, time per trajectory,
+total time, error, reflections, recomputations, failure counters, and observed
+violations for every seed. Construction of the caller-provided metric is
+deliberately outside the timed region; the mandatory binding/revalidation
+against the actual body remains in total wall time and is also reported
+separately. Compare `S/D0` for fixed backend overhead and `D0/D1` for the
+benefit of the supplied relative coordinate scales; do not attribute the
+combined `S/D1` ratio solely to rounding.
 
 ## Limitations
 
