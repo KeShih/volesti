@@ -5,13 +5,20 @@
 // Copyright (c) 2020-2021 Vaibhav Thakkar
 
 // Contributed and/or modified by Vaibhav Thakkar, as part of Google Summer of Code 2021 program.
+// Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
 
 // Licensed under GNU LGPL.3, see LICENCE file
 
 #ifndef ORDER_POLYTOPE_H
 #define ORDER_POLYTOPE_H
 
+#include <cassert>
+#include <cmath>
 #include <iostream>
+#include <limits>
+#include <mutex>
+#include <type_traits>
+#include <vector>
 #include "misc/poset.h"
 #include <Eigen/Eigen>
 #include "preprocess/max_inscribed_ball.hpp"
@@ -28,7 +35,6 @@ public:
     typedef typename Point::FT NT;
     typedef Eigen::Matrix<NT, Eigen::Dynamic, 1> VT;
     typedef Eigen::Matrix<NT, Eigen::Dynamic, Eigen::Dynamic> MT;
-
 private:
     Poset _poset;
     unsigned int _d;    // dimension
@@ -39,15 +45,66 @@ private:
 
     unsigned int _num_hyperplanes;
     bool _normalized;
+    bool _standard_order_facets;
+    unsigned long long _geometry_revision = 0;
+    std::vector<unsigned char> _lower_bound_is_facet, _upper_bound_is_facet;
+    mutable std::vector<unsigned int> _cover_relation_indices;
+    mutable bool _cover_relations_cached;
+    struct ReducedRelationsTag {};
 
 public:
-    OrderPolytope(Poset const& poset) : _poset(poset)
+    OrderPolytope(OrderPolytope const&) = default;
+
+    OrderPolytope& operator=(OrderPolytope const& other)
+    {
+        if (this != &other) {
+            ++_geometry_revision;
+            _poset = other._poset;
+            _d = other._d;
+            b = other.b;
+            _row_norms = other._row_norms;
+            _A = other._A;
+            _num_hyperplanes = other._num_hyperplanes;
+            _normalized = other._normalized;
+            _standard_order_facets = other._standard_order_facets;
+            _lower_bound_is_facet = other._lower_bound_is_facet;
+            _upper_bound_is_facet = other._upper_bound_is_facet;
+            _cover_relation_indices = other._cover_relation_indices;
+            _cover_relations_cached = other._cover_relations_cached;
+        }
+        return *this;
+    }
+
+    OrderPolytope(Poset const& poset, bool apply_transitive_reduction = false)
+        : _poset(apply_transitive_reduction
+                     ? poset.transitive_reduction() : poset),
+          _cover_relations_cached(apply_transitive_reduction)
+    {
+        initialize();
+    }
+
+    static OrderPolytope from_reduced_relations(Poset const& poset)
+    {
+        return OrderPolytope(poset, ReducedRelationsTag{});
+    }
+
+
+private:
+    OrderPolytope(Poset const& poset, ReducedRelationsTag)
+        : _poset(poset), _cover_relations_cached(true)
+    {
+        initialize();
+    }
+
+    void initialize()
     {
         _d = _poset.num_elem();
         _num_hyperplanes = 2*_d + _poset.num_relations(); // 2*d are for >=0 and <=1 constraints
         b = Eigen::MatrixXd::Zero(_num_hyperplanes, 1);
         _A = Eigen::MatrixXd::Zero(_num_hyperplanes, _d);
         _row_norms = Eigen::MatrixXd::Constant(_num_hyperplanes, 1, 1.0);
+        _lower_bound_is_facet.assign(_d, 1);
+        _upper_bound_is_facet.assign(_d, 1);
 
         // first add (ai >= 0) or (-ai <= 0) rows
         _A.topLeftCorner(_d, _d) = -Eigen::MatrixXd::Identity(_d, _d);
@@ -56,18 +113,52 @@ public:
         _A.block(_d, 0, _d, _d) = Eigen::MatrixXd::Identity(_d, _d);
         b.block(_d, 0, _d, 1) = Eigen::MatrixXd::Constant(_d, 1, 1.0);
 
-        // next add the relations
+        // Add the stored order relations.
         unsigned int num_relations = _poset.num_relations();
         for(int idx=0; idx<num_relations; ++idx) {
             std::pair<unsigned int, unsigned int> curr_relation = _poset.get_relation(idx);
             _A(2*_d + idx, curr_relation.first)  = 1;
             _A(2*_d + idx, curr_relation.second) = -1;
+            _upper_bound_is_facet[curr_relation.first] = 0;
+            _lower_bound_is_facet[curr_relation.second] = 0;
         }
         _row_norms.block(2*_d, 0, num_relations, 1) = Eigen::MatrixXd::Constant(num_relations, 1, sqrt(2));
 
+        if (_cover_relations_cached) {
+            _cover_relation_indices.reserve(num_relations);
+            for (unsigned int i = 0; i < num_relations; ++i)
+                _cover_relation_indices.push_back(i);
+        }
+
         _normalized = false;
+        _standard_order_facets = true;
     }
 
+    void cache_cover_relation_indices() const
+    {
+        static std::mutex mutex;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!_cover_relations_cached) {
+            // Poset::transitive_reduction preserves the first occurrence and
+            // relative order of every retained relation.  A single forward
+            // scan therefore maps covers back to their original matrix rows.
+            Poset const covers = _poset.transitive_reduction();
+            _cover_relation_indices.reserve(covers.num_relations());
+            unsigned int stored_index = 0;
+            unsigned int const num_relations = _poset.num_relations();
+            for (unsigned int i = 0; i < covers.num_relations(); ++i) {
+                Poset::RT const cover = covers.get_relation(i);
+                while (stored_index < num_relations &&
+                       _poset.get_relation(stored_index) != cover)
+                    ++stored_index;
+                assert(stored_index < num_relations);
+                _cover_relation_indices.push_back(stored_index++);
+            }
+            _cover_relations_cached = true;
+        }
+    }
+
+public:
 
     // return dimension
     unsigned int dimension() const
@@ -82,6 +173,34 @@ public:
         return _num_hyperplanes;
     }
 
+    bool lower_bound_is_facet(unsigned int i) const {
+        assert(i < _d);
+        return _lower_bound_is_facet[i] != 0;
+    }
+
+    bool upper_bound_is_facet(unsigned int i) const {
+        assert(i < _d);
+        return _upper_bound_is_facet[i] != 0;
+    }
+
+    unsigned int num_order_relations() const { return _poset.num_relations(); }
+    Poset::RT get_order_relation(unsigned int idx) const { return _poset.get_relation(idx); }
+
+    std::vector<unsigned int> const& cover_relation_indices() const {
+        cache_cover_relation_indices();
+        return _cover_relation_indices;
+    }
+
+    unsigned int num_true_facets() const {
+        cache_cover_relation_indices();
+        unsigned int count =
+            static_cast<unsigned int>(_cover_relation_indices.size());
+        for (unsigned int i = 0; i < _d; ++i) {
+            if (lower_bound_is_facet(i)) ++count;
+            if (upper_bound_is_facet(i)) ++count;
+        }
+        return count;
+    }
 
     // get ith column of A
     VT get_col (unsigned int i) const {
@@ -106,9 +225,19 @@ public:
         return b;
     }
 
-    bool is_normalized ()
+    bool is_normalized () const
     {
         return _normalized;
+    }
+
+    bool has_standard_order_facets() const
+    {
+        return _standard_order_facets;
+    }
+
+    unsigned long long geometry_revision() const
+    {
+        return _geometry_revision;
     }
 
     // print polytope in Ax <= b format
@@ -618,9 +747,6 @@ public:
         // iterate over all hyperplanes
         for(unsigned int i = 0; i<rows; ++i) {
             NT a = _A(i, rand_coord);
-            if(_normalized) {
-                a = a / _row_norms(i);
-            }
 
             if (a == NT(0)) {
                 // throw std::runtime_error("Error: division by 0");
@@ -653,12 +779,15 @@ public:
     void linear_transformIt(MT const& T)
     {
         _A = _A * T;
+        _standard_order_facets = false;
+        ++_geometry_revision;
     }
 
     // shift polytope by a point c
     void shift(VT const& c)
     {
         b -= vec_mult(c);
+        ++_geometry_revision;
     }
 
 
@@ -702,6 +831,7 @@ public:
             _A.row(i) /= _row_norms(i);
             b(i) /= _row_norms(i);
         }
+        ++_geometry_revision;
     }
 
 
@@ -722,8 +852,10 @@ public:
 
 
     // compute reflection given dot product and facet
-    void compute_reflection(Point& v, NT dot_prod, unsigned int facet) const
+    void compute_reflection(Point& v, NT dot_prod, int facet) const
     {
+        // Reject the -1 no-hit sentinel before indexing.
+        assert(facet >= 0 && static_cast<unsigned int>(facet) < _num_hyperplanes);
         // calculating -> v += -2 * dot_prod * A.row(facet);
         if (facet < _d) {
             v.set_coord(facet, v[facet] - 2 * dot_prod * (-1.0));
@@ -740,8 +872,9 @@ public:
 
 
     // compute reflection in O(1) time for order polytope
-    void compute_reflection(Point& v, Point const&, unsigned int facet) const
+    void compute_reflection(Point& v, Point const&, int const& facet) const
     {
+        assert(facet >= 0 && static_cast<unsigned int>(facet) < _num_hyperplanes);
         NT dot_prod;
         if (facet < _d) {
             dot_prod = -v[facet];
@@ -759,7 +892,8 @@ public:
     }
 
 
-    template <typename update_parameters>
+    template <typename update_parameters,
+              typename = std::enable_if_t<!std::is_arithmetic_v<update_parameters>>>
     void compute_reflection(Point &v, Point const&, update_parameters const& params) const
     {
         NT dot_prod = params.inner_vi_ak;
