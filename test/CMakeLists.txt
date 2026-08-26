@@ -7,6 +7,7 @@
 # Contributed and/or modified by Vaibhav Thakkar
 # Contributed and/or modified by Ioannis Iakovidis
 # Contributed and/or modified by Korakitis Angelos, as part of Google Summer of Code 2025 program.
+# Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
 
 # Licensed under GNU LGPL.3, see LICENCE file
 
@@ -31,7 +32,6 @@ option(DISABLE_NLP_ORACLES "Disable non-linear oracles (used in collocation)" ON
 option(BUILTIN_EIGEN "Use eigen from ../external" OFF)
 option(BUILTIN_AUTODIFF "Use autodiff from ../external" ON)
 option(USE_MKL "Use MKL library to build eigen" OFF)
-
 if(DISABLE_NLP_ORACLES)
   add_definitions(-DDISABLE_NLP_ORACLES)
 else()
@@ -364,10 +364,19 @@ add_test(NAME simple_mc_integration_over_birkhoff_polytopes
     COMMAND simple_mc_integration -tc=birkhoff)
 
 add_executable (order_polytope order_polytope.cpp $<TARGET_OBJECTS:test_main>)
-add_test(NAME order_polytope_basics COMMAND order_polytope -tc=basics)
-add_test(NAME order_polytope_line_intersect COMMAND order_polytope -tc=line_intersect)
-add_test(NAME order_polytope_reflection COMMAND order_polytope -tc=reflection)
-add_test(NAME order_polytope_vec_mult COMMAND order_polytope -tc=vec_mult)
+add_test(NAME order_polytope COMMAND order_polytope)
+
+add_executable (linear_extensions_volume_test
+        linear_extensions_volume_test.cpp $<TARGET_OBJECTS:test_main>)
+add_test(NAME linear_extensions_volume COMMAND linear_extensions_volume_test)
+
+add_executable (diagonal_rounding_test
+        order_polytope_diagonal_rounding_test.cpp $<TARGET_OBJECTS:test_main>)
+add_test(NAME diagonal_rounding COMMAND diagonal_rounding_test)
+
+add_executable (order_polytope_general_mass
+        order_polytope_modal_hmc.cpp $<TARGET_OBJECTS:test_main>)
+add_test(NAME order_polytope_general_mass COMMAND order_polytope_general_mass)
 
 add_executable (matrix_sampling_test sampling_correlation_matrices_test.cpp $<TARGET_OBJECTS:test_main>)
 add_test(NAME test_corre_spectra_classes COMMAND matrix_sampling_test -tc=corre_spectra)
@@ -456,6 +465,9 @@ TARGET_LINK_LIBRARIES(crhmc_polytope_preparation_test ${PTHREAD} ${GMP} ${MPSOLV
 TARGET_LINK_LIBRARIES(logconcave_sampling_test lp_solve ${IFOPT} ${IFOPT_IPOPT} ${PTHREAD} ${GMP} ${MPSOLVE} ${FFTW3} ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(crhmc_sampling_test lp_solve ${IFOPT} ${IFOPT_IPOPT} ${PTHREAD} ${GMP} ${MPSOLVE} ${FFTW3} ${MKL_LINK} QD_LIB coverage_config)
 TARGET_LINK_LIBRARIES(order_polytope lp_solve coverage_config)
+TARGET_LINK_LIBRARIES(linear_extensions_volume_test lp_solve ${MKL_LINK} coverage_config)
+TARGET_LINK_LIBRARIES(diagonal_rounding_test lp_solve ${MKL_LINK} coverage_config)
+TARGET_LINK_LIBRARIES(order_polytope_general_mass lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(matrix_sampling_test lp_solve ${MKL_LINK} coverage_config)
 TARGET_LINK_LIBRARIES(test_internal_points lp_solve ${MKL_LINK} coverage_config)
 find_package(LAPACK REQUIRED)
