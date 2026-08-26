@@ -2,6 +2,7 @@
 # Copyright (c) 2012-2021 Vissarion Fisikopoulos
 # Copyright (c) 2018-2021 Apostolos Chalkis
 # Contributed and/or modified by Vaibhav Thakkar
+# Contributed and/or modified by Ke Shi, as part of Google Summer of Code 2026 program.
 # Licensed under GNU LGPL.3, see LICENCE file
 
 project( VolEsti )
@@ -110,5 +111,8 @@ else ()
 
   add_executable (order_polytope order_polytope.cpp)
   TARGET_LINK_LIBRARIES(order_polytope ${LP_SOLVE})
+
+  add_executable (log_linear_extensions log_linear_extensions.cpp)
+  TARGET_LINK_LIBRARIES(log_linear_extensions ${LP_SOLVE})
 
 endif()
